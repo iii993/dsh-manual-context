@@ -1,0 +1,6 @@
+node_modules/
+.client-build/
+*.log
+
+# 运行时的手动上下文条目（用户数据，不属于源码）
+manual-context/

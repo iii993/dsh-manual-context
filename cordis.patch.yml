@@ -1,0 +1,4 @@
+# 手动上下文编辑器：把插件挂进 dsh profile
+- insert:
+    - id: manual-context
+      name: '@dsh-external/manual-context'

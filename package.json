@@ -1,0 +1,32 @@
+{
+  "name": "@dsh-external/manual-context",
+  "version": "0.1.0",
+  "private": true,
+  "description": "手动上下文注入 + 对话历史编辑器（DeepSeek Harness 插件）",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": "./src/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}
