@@ -582,6 +582,33 @@ function replaceInPlace(session, seq, target, original, content, identity) {
 }
 
 /**
+ * 当前可见历史里最后一个「声明了、但还没有返回」的工具调用 id。
+ *
+ * 面板手动追加工具返回时，如果用户没指定 callId，就自动接上它 —— 否则工具返回会拿到一个
+ * 随机 callId，和前面的工具调用配不上对，模型侧直接拒（tool result has no matching call）。
+ */
+function lastUnansweredCallId(session) {
+  const events = sessionEvents(session)
+  const declared = []
+  const answered = new Set()
+  for (const seq of session.surface.nodes) {
+    const event = events[seq]
+    if (event === undefined) continue
+    let message = null
+    try { message = session.deriveEventMessage(event) } catch { continue }
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      if (block === null || typeof block !== 'object') continue
+      if (block.type === 'tool-call' && typeof block.id === 'string' && block.id !== '') declared.push(block.id)
+      if (block.type === 'tool-result' && typeof block.toolCallId === 'string' && block.toolCallId !== '') answered.add(block.toolCallId)
+    }
+  }
+  for (let index = declared.length - 1; index >= 0; index -= 1) {
+    if (!answered.has(declared[index])) return declared[index]
+  }
+  return null
+}
+
+/**
  * 一次重放最多允许改写的尾部长度。
  *
  * 模型输出（assistant/message）在 dsh 里**无条件**不允许携带 sourceEventSeqs
@@ -944,7 +971,15 @@ export function appendMessage(ctx, sessionId, spec) {
   }
 
   if (kind === 'tool-result') {
-    const callId = typeof spec?.callId === 'string' && spec.callId.trim() !== '' ? spec.callId.trim() : 'manual-call-' + randomUUID()
+    const explicit = typeof spec?.callId === 'string' && spec.callId.trim() !== '' ? spec.callId.trim() : ''
+    // 没指定 callId 时自动接上「最近一条声明了、但还没有返回」的工具调用。
+    // 以前这里会现生成一个随机 callId，结果工具返回和工具调用配不上对，
+    // 模型侧直接拒：DeepSeek Messages tool result has no matching call。
+    const callId = explicit !== '' ? explicit : lastUnansweredCallId(session)
+    if (callId === null) {
+      throw new Error('当前上下文里没有「已经声明、还没返回」的工具调用。'
+        + '请先追加一条工具调用，工具返回会自动接上它的 callId。')
+    }
     const isError = spec?.isError === true
     let message
     if (sessionFormatVersion(session) >= 4) {

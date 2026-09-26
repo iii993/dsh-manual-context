@@ -517,19 +517,23 @@ test('createEntry 支持指定根目录（全局 / 项目）', () => {
 
 function appendHarness() {
   const appended = []
+  // snapshotEvents 是按顺序展开的数组，内部的 seq 必须和下标对齐 ——
+  // 否则「找未配对的工具调用」这类按 seq 索引的逻辑在测试里永远读不到新事件。
+  const base = [
+    { type: 'turn/start', seq: 0, time: 1, data: { turn: 3 } },
+    { type: 'step/start', seq: 1, time: 2, data: { turn: 3, step: 2 } },
+  ]
   const session = {
     id: 'session-append',
-    seq: 10,
+    get seq() { return base.length + appended.length },
     header: { cwd: join(sandbox, 'ws-append') },
     surface: { nodes: [0, 1] },
-    snapshotEvents: () => [
-      { type: 'turn/start', seq: 0, time: 1, data: { turn: 3 } },
-      { type: 'step/start', seq: 1, time: 2, data: { turn: 3, step: 2 } },
-    ],
-    deriveEventMessage: event => event.data,
+    snapshotEvents: () => [...base, ...appended],
+    deriveEventMessage: event => (event.type === 'user/message' ? event.data : (event.data ? event.data.message : null)),
     append: (type, data, intent) => {
-      const event = { type, seq: 10 + appended.length, time: Date.now(), data, ...intent }
+      const event = { type, seq: base.length + appended.length, time: Date.now(), data, ...intent }
       appended.push(event)
+      if (intent !== undefined && intent.surfaceOp === 'append') session.surface.nodes.push(event.seq)
       return event
     },
   }
@@ -628,10 +632,30 @@ test('appendMessage: 工具返回构造 tool/result 且 callId 自洽', () => {
   assert.equal(result.callId, 'call-1')
 })
 
+test('appendMessage: 工具返回自动接上还没返回的工具调用', () => {
+  const { ctx } = appendHarness()
+  const call = history.appendMessage(ctx, 'session-append', { kind: 'tool-call', text: '读文件', toolName: 'read_file', toolInput: '{}' })
+  const back = history.appendMessage(ctx, 'session-append', { kind: 'tool-result', text: '文件内容' })
+  assert.equal(back.callId, call.callId, '工具返回必须复用工具调用的 callId，否则模型侧会拒')
+})
+
+test('appendMessage: 没有可配对的工具调用时明确报错', () => {
+  const { ctx } = appendHarness()
+  assert.throws(
+    () => history.appendMessage(ctx, 'session-append', { kind: 'tool-result', text: '孤儿返回' }),
+    /没有「已经声明、还没返回」的工具调用/,
+    '凭空造随机 callId 会让模型侧报 tool result has no matching call',
+  )
+})
+
 test('appendMessage: 失败标记落在 tool-result 块上', () => {
   const { ctx, appended } = appendHarness()
+  const call = history.appendMessage(ctx, 'session-append', { kind: 'tool-call', text: '调用', toolName: 'read_file', toolInput: '{}' })
   history.appendMessage(ctx, 'session-append', { kind: 'tool-result', text: '出错了', isError: true })
-  assert.equal(appended[0].data.message.content[0].isError, true)
+  const back = appended[appended.length - 1]
+  // harness 是 v3 会话：tool/result 走 role:'user' + tool-result 包装块的老形状
+  assert.equal(back.data.message.content[0].toolCallId, call.callId)
+  assert.equal(back.data.message.content[0].isError, true)
 })
 
 test('appendMessage: 拒绝空内容与未知类型', () => {
