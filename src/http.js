@@ -766,7 +766,11 @@ export function importMessages(ctx, sessionId, items) {
       if (typeof spec.id === 'string') existing.add(spec.id)
       imported += 1
     } catch (error) {
-      // 单条失败只记原因，绝不抛出：抛出去整批后面的消息就全丢了（用户看到的「只进来一条」）。
+      // 会话空闲时写入必须**排队**（和历史编辑同一套机制），这不能算「跳过」：
+      // 算成跳过，用户看到的就是「导入 0 条 / 跳过 42 条」，而实际上一条都不该丢。
+      // 抛上去由 runOperation 的兜底入队，下一轮 agent/request 时原样重放。
+      if (error !== null && typeof error === 'object' && error.code === 'session-write-pending') throw error
+      // 其余单条失败只记原因，绝不抛出：抛出去整批后面的消息就全丢了（用户看到的「只进来一条」）。
       skip(index, spec.id, error instanceof Error ? error.message : String(error))
     }
   }

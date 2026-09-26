@@ -1327,6 +1327,23 @@ test('事件形状自检拦得住角色不匹配的写入', () => {
 
 // ---------- 导入会话：逐条容错 + 工具调用配对 + 写手动上下文条目 ----------
 
+test('导入会话：空闲会话应整批排队，而不是全算「跳过」', () => {
+  // 用户实测：在没有对话进行中的会话里导入，面板显示「导入 0 条 / 跳过 42 条」。
+  // 原因是 appendMessage 抛的 session-write-pending 被当成单条跳过吃掉了 ——
+  // 那是「排队」信号，必须抛给上层入队，不能计进 skippedReasons。
+  const cwd = join(sandbox, 'import-idle')
+  const built = contextSession(cwd, { open: false })
+  assert.throws(
+    () => http.importMessages(built.ctx, 'session-context', [
+      { id: 'm1', kind: 'user', role: 'user', text: '第一条' },
+      { id: 'm2', kind: 'user', role: 'user', text: '第二条' },
+    ]),
+    (error) => error !== null && typeof error === 'object' && error.code === 'session-write-pending',
+    '空闲会话导入必须抛出写待定错误交给上层排队',
+  )
+  assert.equal(built.appended.length, 0, '排队时一个事件都不该写')
+})
+
 test('导入会话：中间一条坏数据只跳过它自己，后面的消息照常导入', () => {
   const built = movableSession([sysEvent(0, 'sys'), userEvent(1, 'A')], [0, 1])
   built.session.header.version = 4
