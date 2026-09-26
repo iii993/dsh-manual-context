@@ -21,6 +21,7 @@ import assert from 'node:assert/strict'
  *   42 entryView · 43 segList · 44 segIndex · 45 segText · 46 segRole · 47 segDirty
  *   48 dragSegIndex · 49 dragOverSegIndex · 50-55 pending 系列与 composeReasoning
  *   56 importPick · 57 importNotice（目录旁的「导入」按钮与结果反馈）
+ *   58 importWorkspaces · 59 importCwd（导入成条目时选目标工作区）
  */
 const S = {
   open: 0, tab: 1, status: 4, entries: 5, activeId: 6, draft: 7,
@@ -563,6 +564,28 @@ function buttonByText(node, label, out = []) {
   if (Array.isArray(node.children)) for (const child of node.children) buttonByText(child, label, out)
   return out
 }
+
+test('导入面板可以直接选工作区（不依赖正在进行的会话）', async () => {
+  // 导入成条目只需要一个目录：工作区列表来自 dsh 索引 + 活跃会话，
+  // 所以没有对话在跑的工作区也能选。
+  const host = stubHost({
+    workspaces: {
+      ok: true,
+      workspaces: [{ cwd: 'H:\\test', active: false }, { cwd: 'H:\\web', active: true }],
+      cwd: 'H:\\web',
+    },
+  })
+  try {
+    const ui = renderInteractive({ 0: true, 1: 'context' })
+    buttonByText(ui.tree, '导入')[0].props.onClick()
+    await new Promise(function (resolve) { setImmediate(resolve) })
+    const all = texts(ui.tree)
+    assert.ok(all.includes('工作区：'), '导入面板要有工作区下拉')
+    assert.ok(all.some(function (item) { return item.indexOf('H:\\test') >= 0 }), '没有会话在跑的工作区也要列出来')
+  } finally {
+    host.restore()
+  }
+})
 
 /** 点开「导入」，再点一个导入目标。 */
 function openImport(ui, target) {

@@ -308,6 +308,8 @@ window.__ModuleLoader__.load({
       // 工作区目录旁的「导入」按钮：点开先选导入目标（条目 / 历史消息），再挑文件
       const [importPick, setImportPick] = useState(false)
       const [importNotice, setImportNotice] = useState(null)
+      const [importWorkspaces, setImportWorkspaces] = useState([])
+      const [importCwd, setImportCwd] = useState('')
       const mounted = useRef(true)
 
       /** 片段生效的角色：段标记 > 文件 frontmatter > user。 */
@@ -834,6 +836,8 @@ window.__ModuleLoader__.load({
           }
           const value = await api('import-entries', undefined, {
             sessionId: sessionId, rootIndex: newRoot, entries: entries,
+            // 目标工作区：导入条目只需要一个目录，不必先开着那个工作区的会话
+            cwd: importCwd !== '' ? importCwd : undefined,
           })
           if (value !== null && typeof value === 'object' && value.queued === true) {
             setImportNotice('导入已排队：' + String(value.message ?? '下一次对话开始时自动应用'))
@@ -854,6 +858,27 @@ window.__ModuleLoader__.load({
           setError(message)
           showQueuedNotice('导入失败：' + message)
         } finally { setBusy(false) }
+      }
+
+      /**
+       * 拉出所有已知工作区，供「导入成条目」选择目标目录。
+       *
+       * 数据来自 dsh 的工作区索引 + 当前活跃会话，所以没有正在进行的对话也能导入。
+       */
+      const loadImportWorkspaces = async function () {
+        try {
+          const value = await api('workspaces')
+          const list = value !== null && typeof value === 'object' && Array.isArray(value.workspaces) ? value.workspaces : []
+          setImportWorkspaces(list)
+          setImportCwd(function (current) {
+            if (current !== '') return current
+            const here = value !== null && typeof value === 'object' && typeof value.cwd === 'string' ? value.cwd : ''
+            if (here !== '') return here
+            return list.length > 0 ? String(list[0].cwd) : ''
+          })
+        } catch {
+          setImportWorkspaces([])
+        }
       }
 
       /** 导入成当前会话的历史消息：追加到历史末尾（按 message.id 去重）。 */
@@ -1509,10 +1534,28 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'mc-btn', 'data-primary': String(importPick),
               title: '从 JSON 文件导入：可以导入成手动上下文条目（写到上面选的目录），也可以导入成当前会话的历史消息',
-              onClick: function () { setImportPick(!importPick); setImportNotice(null) },
-              disabled: busy || sessionId === null,
+              onClick: function () {
+                const next = !importPick
+                setImportPick(next)
+                setImportNotice(null)
+                if (next) void loadImportWorkspaces()
+              },
+              disabled: busy,
             }, '导入'),
           ),
+          importPick
+            ? h('div', { className: 'mc-row', style: { marginBottom: '6px' } },
+              h('span', { className: 'mc-sub' }, '工作区：'),
+              h('select', {
+                className: 'mc-select', style: { flex: '1' }, value: importCwd,
+                title: '导入成条目时写到哪个工作区（该目录下的 manual-context），不需要那个工作区有会话在跑',
+                onChange: function (event) { setImportCwd(event.target.value) },
+              }, (importWorkspaces.length > 0 ? importWorkspaces : [{ cwd: '', title: null, active: false }]).map(function (item) {
+                return h('option', { key: String(item.cwd), value: String(item.cwd) },
+                  String(item.cwd) + (item.active === true ? '（进行中）' : ''))
+              })),
+            )
+            : null,
           importPick
             ? h('div', { className: 'mc-row', style: { marginBottom: '6px' } },
               h('span', { className: 'mc-sub' }, '导入成：'),

@@ -493,6 +493,7 @@ New-Item -ItemType Junction \
 | GET | `?op=status&sessionId=` | 目录、条目列表、注入状态、编辑档案 |
 | GET | `?op=file&sessionId=&id=` | 读取单个条目 |
 | GET | `?op=history&sessionId=` | 当前模型可见的历史消息 |
+| GET | `?op=workspaces` | 所有已知工作区（dsh 工作区索引 + 活跃会话），供「导入成条目」选目标目录 |
 | GET | `?op=export-session&sessionId=` | 导出当前对话（含手动上下文节点）为一份 JSON |
 | POST | `{op:'save-file'}` / `{op:'create-file', root:0\|1}` / `{op:'delete-file'}` | 条目写操作（`root` 选根目录） |
 | POST | `{op:'save-edit', seq, text?, content?, reasoning?, expectedText?}` | 编辑一条消息；传 `content` 数组可精确改写块（片段编辑走这条路） |
@@ -515,8 +516,10 @@ New-Item -ItemType Junction \
 
 | 目标 | 行为 |
 | --- | --- |
-| **导入成手动上下文条目** | 写成 `.md` / `.txt` 条目，落到下拉里当前选中的那个目录（项目或全局），之后按正常注入流程走 |
+| **导入成手动上下文条目** | 写成 `.md` / `.txt` 条目，落到**你在导入面板里选的工作区**的 `manual-context` 目录（再选项目根还是全局根），之后按正常注入流程走 |
 | **导入成当前会话的历史消息** | 追加到当前对话末尾，按 `message.id` 去重（同一份文件重复导入不会翻倍） |
+
+**导入条目不需要那个工作区有对话在跑** —— 导入面板里有一个「工作区」下拉，列出 dsh 索引里的所有工作区（带「进行中」标记的是当前有会话的），选谁都行，导入是直接写文件、跟会话无关。
 
 文件形态三种都认：导出文件本身 `{messages:[…]}`、裸的 messages 数组、以及 `{entries:[{name,body}]}`。两种目标之间会自动转换（消息→条目会净化文件名；条目→消息用 `import-entry:<name>` 做幂等 id）。
 

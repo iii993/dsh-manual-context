@@ -12,7 +12,8 @@
  *        | 'import-session' | 'import-entries' }
  */
 import { randomUUID } from 'node:crypto'
-import { extname } from 'node:path'
+import { extname, join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { ensureRoots, listEntries, listRoots, readEntry, writeEntry, writeEntryMeta, createEntry, deleteEntry, contextRoots, dshHome, segmentsToBody, readSettings, writeSettings, injectionEnabled } from './store.js'
 import { repairSessions, zstdAvailable } from './repair.js'
 import { listHistoryMessages, applyEdit, forgetEdit, clearEdits, loadEdits, appendMessage, deleteMessages, deletePart, reorderMessages, enqueueOperation, listQueuedSessions, loadQueue, saveQueue, openCoordinates, sessionEvents, appendApplyLog } from './history.js'
@@ -66,6 +67,37 @@ function agentList(ctx) {
   } catch {
     return []
   }
+}
+
+/**
+ * 所有已知工作区。
+ *
+ * 两处来源：dsh 的工作区索引（$DSH_HOME/storages/workspace.json）与当前活跃会话的 cwd。
+ * 导入条目其实只需要一个目录，「必须先开着那个工作区的会话才能导入」是不必要的限制。
+ */
+function listWorkspaces(ctx) {
+  const found = new Map()
+  const put = function (cwd, extra) {
+    if (typeof cwd !== 'string' || cwd === '') return
+    const current = found.get(cwd)
+    found.set(cwd, Object.assign({ cwd: cwd, title: null, active: false }, current ?? {}, extra ?? {}))
+  }
+  for (const agent of agentList(ctx)) {
+    const header = agent?.session?.header
+    put(header?.cwd, { active: true, title: typeof header?.title === 'string' ? header.title : null })
+  }
+  try {
+    const raw = readFileSync(join(dshHome(), 'storages', 'workspace.json'), 'utf8')
+    const parsed = JSON.parse(raw)
+    const projects = parsed !== null && typeof parsed === 'object' && parsed.projects !== null && typeof parsed.projects === 'object' ? parsed.projects : {}
+    for (const project of Object.values(projects)) {
+      if (project === null || typeof project !== 'object') continue
+      put(project.path, { title: typeof project.title === 'string' ? project.title : null })
+    }
+  } catch {
+    // 索引读不到就只列活跃会话
+  }
+  return [...found.values()]
 }
 
 function currentAgent(ctx, sessionId) {
@@ -139,6 +171,11 @@ async function handleGet(ctx, url) {
     case 'export-session': {
       if (sessionId === undefined || sessionId === '') throw new Error('缺少 sessionId')
       return { ok: true, ...exportSession(ctx, sessionId) }
+    }
+    case 'workspaces': {
+      // 导入条目要的是「目录」，不是「会话」—— 这里把 dsh 索引里的工作区都列出来，
+      // 没有正在进行的对话也能选。
+      return { ok: true, workspaces: listWorkspaces(ctx), cwd: cwd ?? null }
     }
     case 'sessions': {
       // 侧边栏入口拿不到 slot 的 sessionId，这里让面板自己挑一个会话
@@ -364,7 +401,13 @@ export function runOperation(ctx, payload) {
       // 把 JSON 里的消息写成手动上下文条目（.md），落到调用方指定的根目录。
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       if (entries.length === 0) throw new Error('没有可导入的条目')
-      return { ok: true, ...importEntries(cwd, entries, payload.rootIndex, payload.format) }
+      // 目标目录优先取调用方直接给的工作区路径：导入条目只需要一个目录，
+      // 不该逼用户先开着那个工作区的会话。
+      const targetCwd = typeof payload?.cwd === 'string' && payload.cwd !== '' ? payload.cwd : cwd
+      if (targetCwd === undefined || targetCwd === null || targetCwd === '') {
+        throw new Error('缺少工作区目录：请先选一个工作区（或打开该工作区的会话）')
+      }
+      return { ok: true, cwd: targetCwd, ...importEntries(targetCwd, entries, payload.rootIndex, payload.format) }
     }
     default:
       throw new Error('未知操作: ' + op)
