@@ -553,15 +553,26 @@ function blankOut(session, seq, position, tag) {
 function replaceInPlace(session, seq, target, original, content, identity) {
   const type = target.type
   const version = sessionFormatVersion(session)
-  // version 必须一起传：v4 的 tool/result 是 role:'tool' 的一等消息，
-  // 少了它就会按 v3 的老形状补成 role:'user'，然后被自己的 assertWritableEvent 拦下
-  // （"tool/result 的消息角色必须是 tool（实际 user）"）。
-  const message = normalizeForWrite(type, {
-    ...(original !== null && typeof original === 'object' ? original : {}),
-    id: 'manual-context-edit:' + randomUUID(),
-    content,
-  }, identity, version)
   const data = target.data !== null && typeof target.data === 'object' ? target.data : {}
+  const carried = data.message !== null && typeof data.message === 'object' ? data.message : null
+  let message
+  if (type === 'tool/result') {
+    // dsh 的硬规则：tool/result 的 surface 替换**只允许改 content**。
+    // 所以这里直接拿原事件的 message 做底（保住 id / role / source / toolCallId / isError），
+    // 既不换 id，也不走 normalizeForWrite 重建 —— 重建会把 isError 之类的字段抹掉，
+    // 一样算「改了 content 以外的东西」。
+    const base = carried !== null ? carried : (original !== null && typeof original === 'object' ? original : {})
+    message = { ...base, content }
+  } else {
+    // 其余类型可以被替换成新节点，用新 id 标记成「编辑产物」。
+    // version 必须一起传：v4 的 tool/result 是 role:'tool' 的一等消息，少了它就会按 v3
+    // 老形状补成 role:'user'，然后被自己的 assertWritableEvent 拦下。
+    message = normalizeForWrite(type, {
+      ...(original !== null && typeof original === 'object' ? original : {}),
+      id: 'manual-context-edit:' + randomUUID(),
+      content,
+    }, identity, version)
+  }
   const payload = type === 'user/message' ? message : { ...data, message }
   assertWritableEvent(type, payload, version)
   return session.append(type, freezeMessage(payload), {

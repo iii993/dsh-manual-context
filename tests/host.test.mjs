@@ -607,6 +607,11 @@ test('编辑 v4 会话的工具返回：必须写成 role:tool，不能退回 ro
   assert.equal(written.data.message.role, 'tool', 'v4 的 tool/result 必须 role:tool')
   assert.equal(written.data.message.source.kind, 'tool')
   assert.equal(written.data.message.content[0].text, '改过的文件内容')
+  // dsh 的硬规则：tool/result 的 surface 替换只允许改 content，
+  // 其余字段（id / toolCallId / source）必须与被替换的节点逐字一致。
+  assert.equal(written.data.message.id, 'tool-1', '替换不得更换 id')
+  assert.equal(written.data.message.toolCallId, 'call-1')
+  assert.deepEqual(written.data.message.source, { kind: 'tool', callId: 'call-1' })
 })
 
 test('appendMessage: 工具返回构造 tool/result 且 callId 自洽', () => {
