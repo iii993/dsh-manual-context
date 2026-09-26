@@ -8,8 +8,11 @@
  *   GET  ?op=sessions                      宿主里可用的会话（侧边栏入口用来挑一个）
  *   POST { op:'save-file' | 'create-file' | 'delete-file' | 'refresh'
  *        | 'save-edit' | 'delete-part' | 'reorder-messages' | 'delete-messages'
- *        | 'forget-edit' | 'clear-edits' | 'append-message' }
+ *        | 'forget-edit' | 'clear-edits' | 'append-message'
+ *        | 'import-session' | 'import-entries' }
  */
+import { randomUUID } from 'node:crypto'
+import { extname } from 'node:path'
 import { ensureRoots, listEntries, listRoots, readEntry, writeEntry, writeEntryMeta, createEntry, deleteEntry, contextRoots, dshHome, segmentsToBody, readSettings, writeSettings, injectionEnabled } from './store.js'
 import { repairSessions, zstdAvailable } from './repair.js'
 import { listHistoryMessages, applyEdit, forgetEdit, clearEdits, loadEdits, appendMessage, deleteMessages, deletePart, reorderMessages, enqueueOperation, listQueuedSessions, loadQueue, saveQueue, openCoordinates, sessionEvents, appendApplyLog } from './history.js'
@@ -357,6 +360,12 @@ export function runOperation(ctx, payload) {
       if (messages.length === 0) throw new Error('没有可导入的消息')
       return { ok: true, ...importMessages(ctx, sessionId, messages) }
     }
+    case 'import-entries': {
+      // 把 JSON 里的消息写成手动上下文条目（.md），落到调用方指定的根目录。
+      const entries = Array.isArray(payload?.entries) ? payload.entries : []
+      if (entries.length === 0) throw new Error('没有可导入的条目')
+      return { ok: true, ...importEntries(cwd, entries, payload.rootIndex, payload.format) }
+    }
     default:
       throw new Error('未知操作: ' + op)
   }
@@ -528,6 +537,9 @@ export function exportSession(ctx, sessionId) {
       reasoning: message.reasoning,
       blocks: message.blocks,
       parts: message.parts,
+      // v4 的一等 tool/result 把配对 id 放在 message.toolCallId 上（content 里没有 tool-result 块）。
+      // 不导出它，导回去的工具返回就成了孤儿，appendMessage 会自动配对失败并抛错。
+      toolCallId: message.toolCallId ?? null,
       manual: typeof id === 'string' && id.startsWith('manual-context:'),
       protected: message.protected,
     }
@@ -553,7 +565,78 @@ function importedKind(item) {
   return null
 }
 
-/** 导出项 → appendMessage 的参数。 */
+/**
+ * 导出项本来就是系统提示词时给出可读的跳过原因。
+ *
+ * 系统提示词由 Harness 每轮重新渲染，导入它只会造成重复，所以**不导入** ——
+ * 但必须让用户看到「跳过了、以及为什么」，不能像以前那样静默吞掉。
+ */
+function systemSkipReason(item) {
+  const kind = typeof item?.kind === 'string' ? item.kind.trim().toLowerCase() : ''
+  const type = typeof item?.type === 'string' ? item.type.trim().toLowerCase() : ''
+  const role = typeof item?.role === 'string' ? item.role.trim().toLowerCase() : ''
+  const isSystem = kind === 'system' || kind === 'system/message' || type === 'system/message' || role === 'system'
+  if (!isSystem) return null
+  return '系统提示词不导入：它每轮由 Harness 重新渲染，导进来只会造成重复'
+}
+
+/**
+ * 导出项 → appendMessage 的 blocks：保留「思维链 + 正文 + 工具调用」的原始组合。
+ *
+ * 一条 assistant 消息在真实日志里常常同时带正文和工具调用。只取 text 的话，
+ * 工具调用（连同 callId）就丢了，导回去只剩半条模型输出，后面的工具返回成孤儿。
+ * 优先用原始的 blocks（导出文件里的 content），没有时退回归一化过的 parts。
+ */
+function importedBlocks(item) {
+  const blocks = []
+  const pushText = function (type, text) {
+    const value = typeof text === 'string' ? text : ''
+    if (value === '') return
+    blocks.push(type === 'reasoning' ? { type: 'reasoning', text: value } : { type: 'text', text: value })
+  }
+  const pushCall = function (name, args, callId) {
+    blocks.push({
+      type: 'tool-call',
+      // 没有 callId 就现生成一个：否则后面的工具返回永远配不上对。
+      callId: typeof callId === 'string' && callId !== '' ? callId : 'manual-call-' + randomUUID(),
+      name: typeof name === 'string' && name !== '' ? name : 'manual_tool',
+      args,
+    })
+  }
+  const raw = Array.isArray(item?.blocks) ? item.blocks : []
+  const parts = Array.isArray(item?.parts) ? item.parts : []
+  if (raw.length > 0) {
+    for (const block of raw) {
+      if (block === null || typeof block !== 'object') continue
+      if (block.type === 'text') { pushText('text', block.text); continue }
+      if (block.type === 'reasoning') { pushText('reasoning', block.text); continue }
+      if (block.type === 'tool-call') {
+        pushCall(block.name ?? block.toolName, block.args ?? block.arguments ?? block.input, block.callId ?? block.id ?? block.toolCallId)
+      }
+    }
+  } else {
+    for (const part of parts) {
+      if (part === null || typeof part !== 'object') continue
+      const type = typeof part.type === 'string' ? part.type : part.kind
+      if (type === 'text') { pushText('text', part.text); continue }
+      if (type === 'reasoning') { pushText('reasoning', part.text); continue }
+      if (type === 'tool-call') pushCall(part.toolName ?? part.name, part.toolInput ?? part.args, part.callId)
+    }
+  }
+  if (blocks.length === 0 && typeof item?.reasoning === 'string' && item.reasoning.trim() !== '') {
+    // 只有思维链、正文为空的模型输出也要能导进来
+    blocks.push({ type: 'reasoning', text: item.reasoning })
+  }
+  return blocks
+}
+
+/**
+ * 导出项 → appendMessage 的参数。
+ *
+ * callId 有三个可能的来源，缺一不可：parts（v3 的 tool-result 块里带着）、
+ * 条目顶层的 callId、以及 v4 一等 tool/result 的 toolCallId。
+ * 任何一处漏读都会让工具返回变成孤儿，appendMessage 直接抛错、整次导入中断。
+ */
 function importedSpec(item) {
   const kind = importedKind(item)
   if (kind === null) return null
@@ -567,19 +650,33 @@ function importedSpec(item) {
     const part = findPart('tool-call')
     spec.toolName = part.toolName ?? item?.toolName
     spec.toolInput = part.toolInput ?? item?.toolInput
-    spec.callId = part.callId ?? item?.callId
+    spec.callId = part.callId ?? item?.callId ?? item?.toolCallId
   }
   if (kind === 'tool-result') {
     const part = findPart('tool-result')
-    spec.callId = part.callId ?? item?.callId
-    spec.isError = item?.isError === true
+    spec.callId = part.callId ?? item?.callId ?? item?.toolCallId
+    spec.isError = part.isError === true || item?.isError === true
   }
+  if (kind === 'assistant') {
+    const blocks = importedBlocks(item)
+    if (blocks.length > 0) spec.blocks = blocks
+  }
+  if (kind === 'reasoning' && spec.text.trim() === '' && typeof item?.reasoning === 'string') spec.text = item.reasoning
   return spec
 }
 
 /**
  * 导入消息：按顺序追加到当前会话末尾。
- * 已存在同样 message.id 的条目会被跳过（幂等），导入的节点照常参与 surface 与守卫。
+ *
+ * 三条铁律（用户反馈的「导入后只进来一条」就是前两条没做到）：
+ *   1. 逐条容错：一条坏数据（配不上对的工具返回、形状不合法…）只跳过它自己，
+ *      绝不中断整次导入 —— 以前任意一条抛错，后面的消息全部无声丢失；
+ *   2. 如实反馈：跳过多少、为什么跳过都写进 skippedReasons，面板才能给用户交代；
+ *   3. 成对导入：同一批里工具调用先落、工具返回后落，callId 不会配丢。
+ *
+ * 已存在同样 message.id 的条目仍然跳过（幂等），导入的节点照常参与 surface 与守卫。
+ *
+ * @returns imported / skipped / seqs / skippedReasons / warnings
  */
 export function importMessages(ctx, sessionId, items) {
   const session = ctx.sessions.get(sessionId)
@@ -589,29 +686,155 @@ export function importMessages(ctx, sessionId, items) {
     const message = event.type === 'user/message' ? event.data : event?.data?.message
     if (message !== null && typeof message === 'object' && typeof message.id === 'string') existing.add(message.id)
   }
-  let imported = 0
-  let skipped = 0
+  const list = Array.isArray(items) ? items : []
   const seqs = []
-  for (const item of items) {
+  const skippedReasons = []
+  const warnings = []
+  let imported = 0
+
+  const skip = function (index, id, reason) {
+    skippedReasons.push({ index, id: typeof id === 'string' && id !== '' ? id : null, reason })
+  }
+
+  // 工具返回必须排在对应的工具调用之后（显式 callId 校验与自动配对都依赖这个顺序）。
+  // 先收齐本批次里出现过的 callId：返回排在调用前面的，押后到所有调用都落完再补。
+  const batchCallIds = new Set()
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    if (systemSkipReason(item) !== null) continue
+    const spec = importedSpec(item)
+    if (spec !== null && spec.kind === 'tool-call' && typeof spec.callId === 'string' && spec.callId !== '') batchCallIds.add(spec.callId)
+  }
+  const deferred = []
+  const seenCallIds = new Set()
+
+  const appendOne = function (index, spec) {
+    if (typeof spec.id === 'string' && existing.has(spec.id)) {
+      skip(index, spec.id, '这条消息已经在会话里了（按 message.id 去重）')
+      return
+    }
+    try {
+      const result = appendMessage(ctx, sessionId, spec)
+      // 只有在真的接上了之后才提示，免得「配不上对、已跳过」时还给用户报成功。
+      if (spec.kind === 'tool-result' && (typeof spec.callId !== 'string' || spec.callId === '')) {
+        warnings.push('第 ' + String(index + 1) + ' 条工具返回没有 callId，已自动接上最近一条还没返回的工具调用')
+      }
+      seqs.push(result.seq)
+      if (typeof spec.id === 'string') existing.add(spec.id)
+      imported += 1
+    } catch (error) {
+      // 单条失败只记原因，绝不抛出：抛出去整批后面的消息就全丢了（用户看到的「只进来一条」）。
+      skip(index, spec.id, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index]
     if (item === null || typeof item !== 'object') {
-      skipped += 1
+      skip(index, null, '不是有效的消息对象（应为 JSON 对象）')
+      continue
+    }
+    const systemReason = systemSkipReason(item)
+    if (systemReason !== null) {
+      skip(index, item.id, systemReason)
       continue
     }
     const spec = importedSpec(item)
     if (spec === null) {
-      skipped += 1
+      const raw = typeof item.kind === 'string' && item.kind !== '' ? item.kind : (typeof item.role === 'string' ? item.role : '')
+      skip(index, item.id, '不支持的消息类型' + (raw === '' ? '' : '：' + raw)
+        + '（只能导入 user / assistant / reasoning / tool-call / tool-result）')
       continue
     }
-    if (typeof spec.id === 'string' && existing.has(spec.id)) {
-      skipped += 1
+    if (spec.kind === 'tool-call' && typeof spec.callId === 'string' && spec.callId !== '') seenCallIds.add(spec.callId)
+    if (spec.kind === 'tool-result' && typeof spec.callId === 'string' && spec.callId !== ''
+      && !seenCallIds.has(spec.callId) && batchCallIds.has(spec.callId)) {
+      deferred.push({ index, spec })
       continue
     }
-    const result = appendMessage(ctx, sessionId, spec)
-    seqs.push(result.seq)
-    if (typeof spec.id === 'string') existing.add(spec.id)
-    imported += 1
+    appendOne(index, spec)
   }
-  return { imported, skipped, seqs }
+  if (deferred.length > 0) {
+    warnings.push('有 ' + String(deferred.length) + ' 条工具返回排在了对应工具调用的前面，已自动调整顺序后追加')
+    for (const pending of deferred) appendOne(pending.index, pending.spec)
+  }
+  return { imported, skipped: skippedReasons.length, seqs, skippedReasons, warnings }
+}
+
+/** import-entries 支持的文件格式 → 扩展名。 */
+const ENTRY_FORMAT_EXTENSIONS = { md: '.md', markdown: '.md', txt: '.txt', text: '.txt' }
+
+/** 条目文件已经带上的文本扩展名（与 store.js 的 TEXT_EXTENSIONS 一致）。 */
+const ENTRY_TEXT_EXTENSIONS = ['.md', '.markdown', '.txt', '.text']
+
+/**
+ * 净化导入文件名：JSON 里的名字可能带目录前缀、Windows 非法字符、结尾的点与空格。
+ * 这里先收拾成一个能安全落到目标目录里的普通文件名，剩下的（重名、长度）交给 store 校验。
+ */
+function sanitizeEntryName(name) {
+  const raw = typeof name === 'string' ? name.trim() : ''
+  if (raw === '') return ''
+  // 只取最后一段路径，绝不允许写到目标根目录之外
+  const parts = raw.split(/[\\/]+/).filter(function (part) { return part !== '' })
+  const base = parts.length === 0 ? '' : parts[parts.length - 1]
+  return base
+    .replace(/[\u0000-\u001f<>:"|?*]/g, '_')
+    .replace(/^\.+/, '')
+    .replace(/[. ]+$/, '')
+    .trim()
+}
+
+/** 文件名没写扩展名（或写了不认识的扩展名）时，补上 format 对应的扩展名。 */
+function withEntryExtension(name, extension) {
+  const current = extname(name).toLowerCase()
+  return ENTRY_TEXT_EXTENSIONS.includes(current) ? name : name + extension
+}
+
+/**
+ * 把 JSON 里的消息写成手动上下文条目，落到调用方指定的 root 目录。
+ *
+ * 逐条容错：文件名净化不了、重名、内容超限都只跳过这一条并给出可读原因，
+ * 不会因为一条坏数据把整批导入丢掉。
+ *
+ * @returns written：[条目 id…]；skipped：[{ name, index, reason }]
+ */
+function importEntries(cwd, entries, rootIndex, format) {
+  const key = typeof format === 'string' && format.trim() !== '' ? format.trim().toLowerCase().replace(/^\./, '') : 'md'
+  const extension = ENTRY_FORMAT_EXTENSIONS[key]
+  if (extension === undefined) {
+    throw new Error('不支持的文件格式：' + String(format) + '（仅支持 md / markdown / txt / text）')
+  }
+  const root = Number.isSafeInteger(rootIndex) && rootIndex >= 0 ? rootIndex : 0
+  ensureRoots(cwd)
+  const written = []
+  const skipped = []
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
+    if (entry === null || typeof entry !== 'object') {
+      skipped.push({ name: '', index, reason: '不是有效的条目对象（应为 JSON 对象）' })
+      continue
+    }
+    const name = sanitizeEntryName(entry.name)
+    if (name === '') {
+      skipped.push({ name: typeof entry.name === 'string' ? entry.name : '', index, reason: '文件名不能为空（或净化后为空）' })
+      continue
+    }
+    let created = null
+    try {
+      const body = typeof entry.body === 'string' ? entry.body : (entry.body === undefined || entry.body === null ? '' : String(entry.body))
+      created = createEntry(cwd, withEntryExtension(name, extension), body, root)
+      // 带了结构化元数据（role / callId / isError…）时用 frontmatter 重写一次，保证配对信息不丢。
+      const meta = entry.meta !== null && typeof entry.meta === 'object' ? entry.meta : null
+      written.push(meta === null ? created.id : writeEntryMeta(cwd, created.id, meta, body).id)
+    } catch (error) {
+      // 元数据这一步失败时把刚建出来的空壳删掉，保证「跳过」就是真的没落盘。
+      if (created !== null) {
+        try { deleteEntry(cwd, created.id) } catch { /* 删不掉就算了，不影响本次导入结果 */ }
+      }
+      skipped.push({ name, index, reason: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return { written, skipped }
 }
 
 function readBody(request) {

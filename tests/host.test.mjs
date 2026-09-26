@@ -1325,3 +1325,221 @@ test('事件形状自检拦得住角色不匹配的写入', () => {
 })
 
 
+// ---------- 导入会话：逐条容错 + 工具调用配对 + 写手动上下文条目 ----------
+
+test('导入会话：中间一条坏数据只跳过它自己，后面的消息照常导入', () => {
+  const built = movableSession([sysEvent(0, 'sys'), userEvent(1, 'A')], [0, 1])
+  built.session.header.version = 4
+  const ctx = {
+    sessions: { get: id => (id === 'session-move' ? built.session : undefined) },
+    agents: { list: () => [] },
+  }
+  const result = http.runOperation(ctx, {
+    op: 'import-session',
+    sessionId: 'session-move',
+    messages: [
+      { id: 'imp-1', kind: 'user', text: '第一条' },
+      { id: 'bad-1', kind: 'tool-result', text: '孤儿工具返回' },
+      null,
+      { id: 'sys-1', kind: 'system', role: 'system', text: '系统提示词' },
+      { id: 'imp-1', kind: 'user', text: '重复 id 不该再进来' },
+      { id: 'imp-2', kind: 'user', text: '最后一条' },
+    ],
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(result.imported, 2, '坏数据前后的两条都要导入成功，而不是一条')
+  assert.equal(result.seqs.length, 2)
+  assert.deepEqual(visibleTexts(built), ['sys', 'A', '第一条', '最后一条'])
+  assert.equal(result.skipped, 4, 'skipped 必须如实统计')
+  assert.equal(result.skippedReasons.length, 4)
+  assert.deepEqual(result.skippedReasons.map(item => item.index), [1, 2, 3, 4])
+  assert.match(result.skippedReasons[0].reason, /工具调用/, '工具返回配不上对时要给可读原因')
+  assert.equal(result.skippedReasons[0].id, 'bad-1')
+  assert.match(result.skippedReasons[1].reason, /不是有效的消息对象/)
+  assert.equal(result.skippedReasons[1].id, null)
+  assert.match(result.skippedReasons[2].reason, /系统提示词/)
+  assert.match(result.skippedReasons[3].reason, /去重/)
+  assert.deepEqual(result.warnings, [])
+})
+
+test('导入会话：工具调用与工具返回成对导入，callId 三种来源都能取到', () => {
+  // v4：callId 只挂在条目顶层的 toolCallId 上（content 里没有 tool-result 块）
+  const v4 = movableSession([sysEvent(0, 'sys')], [0])
+  v4.session.header.version = 4
+  const ctx4 = { sessions: { get: () => v4.session }, agents: { list: () => [] } }
+  const ordered = http.importMessages(ctx4, 'session-move', [
+    { id: 'res-v4', kind: 'tool-result', text: '文件内容', toolCallId: 'call-v4' },
+    {
+      id: 'call-v4', kind: 'tool-call', text: '读一下', toolName: 'read_file', toolInput: '{"path":"a.md"}',
+      parts: [{ kind: 'tool-call', callId: 'call-v4', toolName: 'read_file', toolInput: '{"path":"a.md"}' }],
+    },
+  ])
+  assert.equal(ordered.imported, 2, JSON.stringify(ordered.skippedReasons))
+  assert.deepEqual(v4.appended.map(event => event.type), ['assistant/message', 'tool/result'], '调用必须先落、返回后落')
+  const callBlock = v4.appended[0].data.message.content.find(block => block.type === 'tool-call')
+  assert.equal(callBlock.id, 'call-v4')
+  assert.equal(v4.appended[1].data.message.role, 'tool')
+  assert.equal(v4.appended[1].data.message.toolCallId, 'call-v4')
+  assert.ok(ordered.warnings.some(text => text.indexOf('调整顺序') >= 0), '自动补序要留下提示')
+
+  // v3：callId 藏在 parts 的 tool-result 块里（旧导出文件）
+  const v3 = movableSession([sysEvent(0, 'sys')], [0])
+  const ctx3 = { sessions: { get: () => v3.session }, agents: { list: () => [] } }
+  const paired = http.importMessages(ctx3, 'session-move', [
+    { id: 'call-3', kind: 'tool-call', text: '', parts: [{ kind: 'tool-call', callId: 'c-3', toolName: 't', toolInput: '{}' }] },
+    { id: 'res-3', kind: 'tool-result', text: '结果', parts: [{ kind: 'tool-result', callId: 'c-3' }] },
+  ])
+  assert.equal(paired.imported, 2, JSON.stringify(paired.skippedReasons))
+  assert.equal(v3.appended[1].type, 'tool/result')
+  assert.equal(v3.appended[1].data.message.role, 'user', 'v3 的 tool/result 仍是 role:user 包装')
+  assert.equal(v3.appended[1].data.message.content[0].toolCallId, 'c-3')
+
+  // 顶层 callId（手工拼的 JSON）同样认
+  const manual = movableSession([sysEvent(0, 'sys')], [0])
+  const ctxManual = { sessions: { get: () => manual.session }, agents: { list: () => [] } }
+  const fromTop = http.importMessages(ctxManual, 'session-move', [
+    { id: 'call-top', kind: 'tool-call', text: '', callId: 'top-1' },
+    { id: 'res-top', kind: 'tool-result', text: '结果', callId: 'top-1' },
+  ])
+  assert.equal(fromTop.imported, 2, JSON.stringify(fromTop.skippedReasons))
+  assert.equal(manual.appended[1].data.message.content[0].toolCallId, 'top-1')
+
+  // 没写 callId 的工具返回会自动接上最近一条还没返回的调用，并在 warnings 里留痕
+  const auto = movableSession([sysEvent(0, 'sys')], [0])
+  const ctxAuto = { sessions: { get: () => auto.session }, agents: { list: () => [] } }
+  const autoResult = http.importMessages(ctxAuto, 'session-move', [
+    { id: 'call-auto', kind: 'tool-call', text: '', callId: 'auto-1' },
+    { id: 'res-auto', kind: 'tool-result', text: '结果' },
+  ])
+  assert.equal(autoResult.imported, 2, JSON.stringify(autoResult.skippedReasons))
+  assert.equal(auto.appended[1].data.message.content[0].toolCallId, 'auto-1', '自动配对要接上前一条调用')
+  assert.ok(autoResult.warnings.some(text => text.indexOf('没有 callId') >= 0))
+})
+
+test('import-entries：把 JSON 消息写成手动上下文条目，重名与非法名字只跳过自己', async () => {
+  const cwd = join(sandbox, 'ws-import-entries')
+  const session = { id: 'session-entries', header: { cwd } }
+  const ctx = {
+    sessions: { get: id => (id === 'session-entries' ? session : undefined) },
+    agents: { list: () => [{ id: 'session-entries', session, status: 'idle' }] },
+  }
+  const call = payload => httpCall(ctx, payload)
+  const result = await call({
+    op: 'import-entries',
+    sessionId: 'session-entries',
+    rootIndex: 0,
+    entries: [
+      { name: '规则', body: '必须使用中文' },
+      { name: 'notes', body: '没有扩展名要补 .md' },
+      { name: 'a/b/嵌套.md', body: '净化路径前缀' },
+      { name: 'con:bad?.md', body: '净化非法字符' },
+      { name: '规则', body: '重名' },
+      { name: '', body: '空名字' },
+      { name: '...', body: '净化后为空' },
+      { name: '带元数据', body: '配对信息', meta: { role: 'tool-result', callId: 'manual-call-1' } },
+    ],
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.deepEqual(result.written, ['0:规则.md', '0:notes.md', '0:嵌套.md', '0:con_bad_.md', '0:带元数据.md'])
+  assert.equal(result.skipped.length, 3)
+  assert.match(result.skipped[0].reason, /已存在/, '重名要给出可读原因')
+  assert.match(result.skipped[1].reason, /文件名/)
+  assert.match(result.skipped[2].reason, /净化后为空/)
+
+  // 落盘内容必须真的对得上
+  assert.equal(store.readEntry(cwd, '0:规则.md').content, '必须使用中文')
+  assert.equal(store.readEntry(cwd, '0:嵌套.md').content, '净化路径前缀')
+  const withMeta = store.readEntry(cwd, '0:带元数据.md')
+  assert.equal(withMeta.role, 'tool-result')
+  assert.ok(withMeta.content.indexOf('callId: manual-call-1') >= 0, '元数据要写成 frontmatter')
+
+  // format 参数决定扩展名；不支持的格式直接报错
+  const txt = await call({ op: 'import-entries', sessionId: 'session-entries', entries: [{ name: '说明', body: 'x' }], format: 'txt' })
+  assert.deepEqual(txt.written, ['0:说明.txt'])
+
+  // rootIndex 指向全局根目录
+  const inHome = await call({ op: 'import-entries', sessionId: 'session-entries', rootIndex: 1, entries: [{ name: '全局条目', body: 'y' }] })
+  assert.deepEqual(inHome.written, ['1:全局条目.md'])
+  assert.ok(store.listRoots(cwd)[1].path.indexOf(join(sandbox, 'home')) === 0)
+
+  const badFormat = await call({ op: 'import-entries', sessionId: 'session-entries', entries: [{ name: 'x', body: 'y' }], format: 'pdf' })
+  assert.equal(badFormat.ok, false)
+  assert.match(badFormat.error, /不支持的文件格式/)
+
+  const empty = await call({ op: 'import-entries', sessionId: 'session-entries', entries: [] })
+  assert.equal(empty.ok, false)
+  assert.match(empty.error, /没有可导入的条目/)
+})
+
+test('导出 → 导入往返：工具轨迹与正文都不丢、不重复', () => {
+  const toolResultEvent = (seq, callId, text) => ({
+    type: 'tool/result',
+    seq,
+    time: seq,
+    data: {
+      turn: 1,
+      step: 1,
+      message: { id: 't' + String(seq), role: 'tool', toolCallId: callId, content: [{ type: 'text', text }], source: { kind: 'tool', callId } },
+    },
+  })
+  const source = movableSession([
+    sysEvent(0, '系统提示词'),
+    userEvent(1, '问一句话'),
+    assistantEvent(2, '答一句话', 'call-1', 'read_file'),
+    toolResultEvent(3, 'call-1', '文件内容'),
+  ], [0, 1, 2, 3])
+  source.session.header.version = 4
+  const ctx = {
+    sessions: { get: () => source.session },
+    agents: { list: () => [{ id: 'session-move', options: { provider: 'deepseek', model: 'v3' } }] },
+  }
+  const file = http.exportSession(ctx, 'session-move')
+  assert.equal(file.messages.length, 4)
+  assert.equal(file.messages[3].toolCallId, 'call-1', 'v4 一等 tool/result 的配对 id 必须导出')
+
+  const target = movableSession([sysEvent(0, 'sys')], [0])
+  target.session.header.version = 4
+  const ctxTarget = {
+    sessions: { get: () => target.session },
+    agents: { list: () => [{ id: 'session-move', options: { provider: 'deepseek', model: 'v3' } }] },
+  }
+  const result = http.importMessages(ctxTarget, 'session-move', file.messages)
+  assert.equal(result.imported, 3, JSON.stringify(result.skippedReasons))
+  assert.equal(result.skipped, 1)
+  assert.match(result.skippedReasons[0].reason, /系统提示词/)
+  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话', '文件内容'], '正文与工具返回一条都不能丢')
+  const assistant = target.appended.find(event => event.type === 'assistant/message')
+  const callBlock = assistant.data.message.content.find(block => block.type === 'tool-call')
+  assert.equal(callBlock.id, 'call-1', '模型输出里的工具调用要连着 callId 一起导进来')
+  const toolResult = target.appended.find(event => event.type === 'tool/result')
+  assert.equal(toolResult.data.message.toolCallId, 'call-1')
+
+  // 同一份文件再导一次：全部按 message.id 去重，不翻倍
+  const again = http.importMessages(ctxTarget, 'session-move', file.messages)
+  assert.equal(again.imported, 0)
+  assert.equal(again.skipped, 4)
+  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话', '文件内容'])
+})
+
+test('导入修复前导出的旧文件（工具返回没有 callId）也能自动配对', () => {
+  const built = movableSession([sysEvent(0, 'sys')], [0])
+  built.session.header.version = 4
+  const ctx = { sessions: { get: () => built.session }, agents: { list: () => [] } }
+  const result = http.importMessages(ctx, 'session-move', [
+    { id: 'u-old', kind: 'user', text: '问' },
+    {
+      id: 'a-old', kind: 'assistant', text: '读一下',
+      blocks: [{ type: 'text', text: '读一下' }, { type: 'tool-call', id: 'call-old', name: 'read_file', arguments: '{"path":"a.md"}' }],
+    },
+    { id: 't-old', kind: 'tool-result', text: '文件内容' },
+  ])
+  assert.equal(result.imported, 3, JSON.stringify(result.skippedReasons))
+  assert.equal(built.appended[2].data.message.toolCallId, 'call-old', '要接上模型输出里的工具调用')
+  assert.ok(result.warnings.some(text => text.indexOf('没有 callId') >= 0))
+  assert.deepEqual(visibleTexts(built), ['sys', '问', '读一下', '文件内容'])
+})
+
+
+
+
+

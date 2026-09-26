@@ -19,6 +19,8 @@ import assert from 'node:assert/strict'
  *   32 editingPart · 33 focusPart · 34 dragSeq · 35 dragOverSeq · 36 sessionId
  *   37 sessionOptions · 38 entryEnabled · 39 entryWeight · 40 dragEntryId · 41 dragOverEntry
  *   42 entryView · 43 segList · 44 segIndex · 45 segText · 46 segRole · 47 segDirty
+ *   48 dragSegIndex · 49 dragOverSegIndex · 50-55 pending 系列与 composeReasoning
+ *   56 importPick · 57 importNotice（目录旁的「导入」按钮与结果反馈）
  */
 const S = {
   open: 0, tab: 1, status: 4, entries: 5, activeId: 6, draft: 7,
@@ -489,3 +491,213 @@ test('选中片段后详情只显示该片段', () => {
   assert.ok(texts(tree).includes('编辑该片段'))
   assert.ok(texts(tree).includes('删除该片段'))
 })
+
+// ---- 工作区目录旁的「导入」按钮 ----------------------------------------------
+
+/** 手动上下文页的初始状态（带根目录清单）。 */
+const CONTEXT_TAB = {
+  0: true, 1: 'context',
+  4: {
+    cwd: '/w',
+    roots: [
+      { index: 0, path: '/w/manual-context', label: '项目（当前工作区）' },
+      { index: 1, path: '/home/.dsh/manual-context', label: '全局（DSH 根目录）' },
+    ],
+    injected: [],
+  },
+}
+
+/**
+ * 可交互渲染：useState 接一个真的状态仓库，setter 会重画整棵元素树。
+ *
+ * 上面的 render() 里 setter 是空函数（只服务静态布局断言），点按钮什么都不会发生；
+ * 这里单开一份，专门验证「点一下之后界面上真的多出东西」。
+ */
+function renderInteractive(overrides = {}) {
+  const bundle = cached
+  const store = new Map()
+  let index = 0
+  let tree = null
+  const React = {
+    Fragment: Symbol('Fragment'),
+    createElement(type, props) {
+      return { type, props: props || {}, children: Array.prototype.slice.call(arguments, 2) }
+    },
+    useState(initial) {
+      const at = index
+      index += 1
+      if (!store.has(at)) {
+        store.set(at, Object.prototype.hasOwnProperty.call(overrides, at)
+          ? overrides[at]
+          : (typeof initial === 'function' ? initial() : initial))
+      }
+      return [store.get(at), function (next) {
+        store.set(at, typeof next === 'function' ? next(store.get(at)) : next)
+        draw()
+      }]
+    },
+    useEffect() {},
+    useLayoutEffect() {},
+    useCallback(fn) { return fn },
+    useMemo(fn) { return fn() },
+    useRef(value) { return { current: value } },
+  }
+  const mod = bundle.factory(function requireStub(name) {
+    if (name === 'react') return React
+    throw new Error('未预期的 require: ' + name)
+  })
+  const props = { sessionId: 'session-render' }
+  function draw() { index = 0; tree = mod.ManualContextEditor(props) }
+  draw()
+  return { get tree() { return tree } }
+}
+
+/** 文本正好只有 label 的按钮（按钮文字都是单个文本子节点）。 */
+function buttonByText(node, label, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) { for (const child of node) buttonByText(child, label, out); return out }
+  if (node.type === 'button' && Array.isArray(node.children)) {
+    const flat = texts(node)
+    if (flat.length === 1 && flat[0] === label) out.push(node)
+  }
+  if (Array.isArray(node.children)) for (const child of node.children) buttonByText(child, label, out)
+  return out
+}
+
+/** 点开「导入」，再点一个导入目标。 */
+function openImport(ui, target) {
+  buttonByText(ui.tree, '导入')[0].props.onClick()
+  buttonByText(ui.tree, target)[0].props.onClick()
+  return ui
+}
+
+/**
+ * 把 document / fetch / setTimeout 换成最小桩，跑完恢复。
+ * handlers 按 op 给响应体；created 是面板新建的 DOM 元素（文件选择框）。
+ */
+function stubHost(handlers) {
+  const created = []
+  const calls = []
+  const previous = {
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+  }
+  globalThis.setTimeout = function () { return 0 }
+  globalThis.document = {
+    querySelector() { return null },
+    createElement(tag) {
+      const el = {
+        tagName: tag, dataset: {}, style: {}, files: null, textContent: '',
+        appendChild() {}, remove() {}, click() { created.push(el) },
+      }
+      return el
+    },
+    head: { appendChild() {} },
+    body: { appendChild() {} },
+  }
+  globalThis.fetch = async function (url, init) {
+    const body = init !== undefined && typeof init.body === 'string' ? JSON.parse(init.body) : null
+    const op = body !== null ? body.op : new URL(String(url), 'http://localhost').searchParams.get('op')
+    calls.push({ op, body })
+    return { status: 200, async text() { return JSON.stringify(handlers[op] ?? { ok: true }) } }
+  }
+  return {
+    created, calls,
+    restore() {
+      globalThis.document = previous.document
+      globalThis.fetch = previous.fetch
+      globalThis.setTimeout = previous.setTimeout
+    },
+  }
+}
+
+test('工作区目录下拉旁有独立的「导入」按钮，点一下先选导入目标', () => {
+  const ui = renderInteractive(CONTEXT_TAB)
+  const button = buttonByText(ui.tree, '导入')[0]
+  assert.ok(button !== undefined, '目录下拉旁能看到「导入」按钮')
+  assert.ok(String(button.props.title || '').includes('导入'), '导入按钮要有 title 说明')
+  assert.equal(button.props.disabled, false)
+  const rows = byClass(ui.tree, 'mc-row').filter(row => texts(row).includes('导入'))
+  assert.ok(rows.some(row => findByType(row, 'select', props => String(props.className || '').includes('mc-select')).length > 0),
+    '「导入」按钮与目录下拉在同一行')
+  assert.equal(texts(ui.tree).includes('导入成手动上下文条目'), false, '没点之前不显示目标选择')
+  button.props.onClick()
+  const all = texts(ui.tree)
+  assert.ok(all.includes('导入成手动上下文条目'), '点开后能选「导入成手动上下文条目」')
+  assert.ok(all.includes('导入成当前会话的历史消息'), '点开后能选「导入成当前会话的历史消息」')
+})
+
+test('忙碌时「导入」按钮禁用', () => {
+  const ui = renderInteractive(Object.assign({}, CONTEXT_TAB, { 2: true }))
+  assert.equal(buttonByText(ui.tree, '导入')[0].props.disabled, true)
+})
+
+test('导入成手动上下文条目：走 import-entries，落到选中目录并报出成功与跳过条数', async () => {
+  const host = stubHost({
+    // 后端返回的 written 是「写成功的条目 id 数组」，skipped 是 [{ name, index, reason }]
+    'import-entries': { ok: true, written: ['0:a.md', '1:b.md'], skipped: [{ name: 'b.md', index: 1, reason: '条目已存在' }] },
+    status: { ok: true, cwd: '/w', entries: [], roots: CONTEXT_TAB[4].roots, injected: [] },
+  })
+  try {
+    const ui = renderInteractive(Object.assign({}, CONTEXT_TAB, { 14: 1 }))
+    openImport(ui, '导入成手动上下文条目')
+    const input = host.created[0]
+    assert.ok(input !== undefined, '点目标后弹出文件选择框')
+    assert.equal(input.accept, '.json,application/json')
+    input.files = [{ text: async () => JSON.stringify({ entries: [{ name: 'a.md', body: '甲' }, { name: 'b.md', body: '乙' }] }) }]
+    await input.onchange()
+    const call = host.calls.find(item => item.op === 'import-entries')
+    assert.ok(call !== undefined, '调的是 import-entries')
+    assert.equal(call.body.rootIndex, 1, '落到目录下拉当前选中的那个目录')
+    assert.deepEqual(call.body.entries, [{ name: 'a.md', body: '甲' }, { name: 'b.md', body: '乙' }])
+    const all = texts(ui.tree)
+    assert.ok(all.some(t => t.includes('已导入 2 条') && t.includes('全局（DSH 根目录）')), '要报出成功条数与目标目录')
+    assert.ok(all.some(t => t.includes('跳过 1 条') && t.includes('条目已存在')), '要报出跳过条数与原因')
+  } finally { host.restore() }
+})
+
+test('导入成历史消息：走 import-session，报出导入与跳过条数', async () => {
+  const host = stubHost({
+    'import-session': { ok: true, imported: 1, skipped: 2, seqs: [7] },
+    history: { ok: true, messages: [], edits: [], nodes: [] },
+  })
+  try {
+    const ui = renderInteractive(CONTEXT_TAB)
+    openImport(ui, '导入成当前会话的历史消息')
+    host.created[0].files = [{ text: async () => JSON.stringify({ messages: [{ id: 'u1', kind: 'user', text: '你好' }] }) }]
+    await host.created[0].onchange()
+    const call = host.calls.find(item => item.op === 'import-session')
+    assert.ok(call !== undefined, '调的是 import-session')
+    assert.deepEqual(call.body.messages, [{ id: 'u1', kind: 'user', text: '你好' }])
+    const all = texts(ui.tree)
+    assert.ok(all.some(t => t.includes('已导入 1 条历史消息')), '要报出导入条数')
+    assert.ok(all.some(t => t.includes('跳过 2 条')), '要报出跳过条数')
+  } finally { host.restore() }
+})
+
+test('裸数组与 { messages } 导出文件都能转成手动上下文条目', async () => {
+  const host = stubHost({
+    'import-entries': { ok: true, written: ['0:b_c.md'], skipped: [] },
+    status: { ok: true, cwd: '/w', entries: [], roots: CONTEXT_TAB[4].roots, injected: [] },
+  })
+  try {
+    const ui = renderInteractive(CONTEXT_TAB)
+    openImport(ui, '导入成手动上下文条目')
+    host.created[0].files = [{ text: async () => JSON.stringify([{ id: 'a/b:c', text: '裸数组正文' }]) }]
+    await host.created[0].onchange()
+    const first = host.calls.filter(item => item.op === 'import-entries')[0]
+    assert.equal(first.body.entries[0].body, '裸数组正文', '裸数组当成 messages，再转成条目')
+    assert.equal(first.body.entries[0].name.includes('/'), false, '文件名里的路径分隔符要清掉')
+    assert.ok(texts(ui.tree).some(t => t.includes('由 1 条消息转成条目')), '反馈里要说清是转换来的')
+    // 导出文件本身 { messages: [...] } 走同一个转换
+    openImport(ui, '导入成手动上下文条目')
+    host.created[1].files = [{ text: async () => JSON.stringify({ messages: [{ kind: 'assistant', text: '导出正文' }] }) }]
+    await host.created[1].onchange()
+    const calls = host.calls.filter(item => item.op === 'import-entries')
+    assert.equal(calls.length, 2)
+    assert.equal(calls[1].body.entries[0].body, '导出正文')
+    assert.equal(calls[1].body.entries[0].name, '导入条目-1.md', '没有 id 的消息给兜底名')
+  } finally { host.restore() }
+})
+

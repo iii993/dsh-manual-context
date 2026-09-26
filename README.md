@@ -501,10 +501,31 @@ New-Item -ItemType Junction \
 | POST | `{op:'delete-messages', seqs}` / `{op:'forget-edit', seq}` / `{op:'clear-edits'}` | 批量删除与编辑档案维护 |
 | POST | `{op:'append-message', kind, text, toolName?, toolInput?, callId?, isError?}` | 追加新消息（`kind`: user / assistant / tool-call / tool-result） |
 | POST | `{op:'import-session', messages:[…]}` | 从导出的 JSON 导入对话，按 `message.id` 去重后**追加**到当前会话末尾 |
+| POST | `{op:'import-entries', rootIndex, entries:[{name,body,meta?}], format?}` | 把 JSON 里的内容写成手动上下文条目，落到 `rootIndex` 指定的目录（文件名会净化；重名、非法名只跳过这一条） |
 | POST | `{op:'sync-context'}` | 立即把手动上下文条目同步进会话（空闲时排队，下一轮请求自动应用） |
 | POST | `{op:'edit-pending', queueIndex, text}` | 改写一条**排队中、还没写进日志**的追加消息（只能改面板里手动追加的；手动上下文的正文请去条目页改） |
 | POST | `{op:'drop-pending', queueIndex}` | 丢弃一条排队中的改动（还没落盘，丢掉不留痕迹） |
 | POST | `{op:'save-segments', id, meta?, segments:[{meta,text},…]}` | 片段级保存：宿主用 `segmentsToBody` 把片段数组重组成正文写盘 |
+
+### 导入 / 导出
+
+**导出**：「历史」标签工具栏的「导出」把当前对话导成一份 JSON（含手动上下文节点）。
+
+**导入**：在**「手动上下文」页、工作区目录下拉的同一行**有一个独立的「导入」按钮。点开后先选目标：
+
+| 目标 | 行为 |
+| --- | --- |
+| **导入成手动上下文条目** | 写成 `.md` / `.txt` 条目，落到下拉里当前选中的那个目录（项目或全局），之后按正常注入流程走 |
+| **导入成当前会话的历史消息** | 追加到当前对话末尾，按 `message.id` 去重（同一份文件重复导入不会翻倍） |
+
+文件形态三种都认：导出文件本身 `{messages:[…]}`、裸的 messages 数组、以及 `{entries:[{name,body}]}`。两种目标之间会自动转换（消息→条目会净化文件名；条目→消息用 `import-entry:<name>` 做幂等 id）。
+
+两个要点：
+
+- **逐条容错**：坏数据、重复 id、系统提示词、配对不上的工具返回都只跳过它自己并给出原因，**不会让整批导入中断**；面板会明确显示「成了几条 / 跳了几条 / 为什么」。
+- **工具轨迹成对导入**：工具调用的 callId 会跟着导出。v4 的一等 tool/result 把配对 id 放在 message.toolCallId 上，早期版本导出时漏了它，导回去的工具返回就成了孤儿。导入时按 part.callId 到 item.callId 到 item.toolCallId 三处兜底；工具返回排在调用前面时自动押后补序。
+
+> 系统提示词**不会**被导入：它每轮由 Harness 重新渲染，不是能搬来搬去的普通消息。它会出现在「跳过原因」里，而不是静默消失。
 
 ## 排查
 

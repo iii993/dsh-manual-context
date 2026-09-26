@@ -209,7 +209,12 @@ export function messageParts(message, kind) {
     if (block === null || typeof block !== 'object') continue
     const type = typeof block.type === 'string' ? block.type : 'block'
     if (type === 'text') {
-      parts.push({ index, type, kind, label: labelOf(kind), text: typeof block.text === 'string' ? block.text : '' })
+      // v4 的一等 tool/result：content 里只有普通 text 块，配对 id 在 message.toolCallId 上。
+      // 首个片段补上 callId，导出/导入才不会把工具返回变成孤儿。
+      const carried = typeof message?.toolCallId === 'string' && message.toolCallId !== '' ? message.toolCallId : ''
+      const part = { index, type, kind, label: labelOf(kind), text: typeof block.text === 'string' ? block.text : '' }
+      if (carried !== '' && parts.length === 0) part.callId = carried
+      parts.push(part)
       continue
     }
     if (type === 'reasoning') {
@@ -306,6 +311,9 @@ export function listHistoryMessages(ctx, sessionId) {
       blocks: message.content,
       parts: messageParts(message, kind),
       toolCalls: messageToolCalls(message),
+      // v4 的一等 tool/result 把配对 id 放在 message.toolCallId 上（content 里没有 tool-result 块），
+      // 不单独带出来的话导出文件就丢了配对信息，导回去时工具返回会变成孤儿。
+      toolCallId: typeof message?.toolCallId === 'string' && message.toolCallId !== '' ? message.toolCallId : null,
       edited: editedSeqs.has(seq),
       editedAt: edits.find(edit => edit.replacedSeq === seq)?.updatedAt ?? null,
       pendingDelete: pendingDeletes.has(seq),

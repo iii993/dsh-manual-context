@@ -305,6 +305,9 @@ window.__ModuleLoader__.load({
       const [pendingToolName, setPendingToolName] = useState('')
       const [pendingToolInput, setPendingToolInput] = useState('')
       const [composeReasoning, setComposeReasoning] = useState('')
+      // 工作区目录旁的「导入」按钮：点开先选导入目标（条目 / 历史消息），再挑文件
+      const [importPick, setImportPick] = useState(false)
+      const [importNotice, setImportNotice] = useState(null)
       const mounted = useRef(true)
 
       /** 片段生效的角色：段标记 > 文件 frontmatter > user。 */
@@ -722,37 +725,172 @@ window.__ModuleLoader__.load({
         finally { setBusy(false) }
       }
 
-      /** 解析导入文件：既接受导出文件本身，也接受裸的 messages 数组。 */
-      const messagesOfImport = function (text) {
+      /**
+       * 解析导入文件：三种形态都吃。
+       *   1) 导出文件本身 { messages: [...] }；
+       *   2) 裸数组 [...]（当成 messages）；
+       *   3) 条目形态 { entries: [{ name, body }] }。
+       * 「导入成条目」与「导入成历史消息」共用一个解析器，缺哪种形态时由调用方给出提示。
+       */
+      const parseImportFile = function (text) {
         let parsed
         try {
           parsed = JSON.parse(text)
         } catch (caught) {
           throw new Error('JSON 解析失败：' + String(caught && caught.message ? caught.message : caught))
         }
-        if (Array.isArray(parsed)) return parsed
-        if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.messages)) return parsed.messages
-        throw new Error('导入文件里没有 messages 数组')
+        const root = Array.isArray(parsed) ? { messages: parsed } : parsed
+        if (root === null || typeof root !== 'object') throw new Error('导入文件既不是数组也不是对象')
+        return {
+          messages: Array.isArray(root.messages) ? root.messages : [],
+          entries: Array.isArray(root.entries) ? root.entries : [],
+        }
       }
 
-      /** 选择 JSON 文件并导入到当前会话末尾（按 message.id 去重）。 */
-      const pickImportFile = function () {
-        if (sessionId === null || sessionId === '') return
+      /** 条目文件名：去掉路径与 Windows 非法字符，空名/点开头给个兜底（扩展名由宿主补 .md）。 */
+      const importEntryName = function (raw, index) {
+        const base = (typeof raw === 'string' ? raw : '')
+          .split(/[\\/]/).pop()
+          .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+          .trim()
+        if (base === '' || base.startsWith('.')) return '导入条目-' + String(index + 1) + '.md'
+        return base
+      }
+
+      /** messages 形态兜底成条目形态：每条消息一个条目，正文取 text（没有就退回 JSON）。 */
+      const entriesFromMessages = function (messages) {
+        return messages.map(function (item, index) {
+          const message = item !== null && typeof item === 'object' ? item : {}
+          let body = typeof message.text === 'string' ? message.text : ''
+          if (body === '') {
+            try { body = JSON.stringify(message.blocks ?? message.parts ?? message, null, 2) ?? '' } catch { body = '' }
+          }
+          return { name: importEntryName(message.id, index), body: body }
+        })
+      }
+
+      /** 条目形态兜底成消息形态：一个条目一条用户消息（id 由条目名决定，重复导入不会翻倍）。 */
+      const messagesFromEntries = function (entries) {
+        return entries.map(function (item, index) {
+          const entry = item !== null && typeof item === 'object' ? item : {}
+          const name = importEntryName(entry.name, index)
+          let body = typeof entry.body === 'string' ? entry.body : ''
+          if (body === '' && typeof entry.content === 'string') body = entry.content
+          return { id: 'import-entry:' + name, kind: 'user', text: body }
+        })
+      }
+
+      /** 跳过原因拼成一句：最多列 3 条，其余用数量收尾。 */
+      const skipReasonText = function (skipped) {
+        const rows = Array.isArray(skipped) ? skipped : []
+        const shown = rows.slice(0, 3).map(function (item) {
+          const row = item !== null && typeof item === 'object' ? item : {}
+          const name = typeof row.name === 'string' && row.name !== '' ? row.name : '（未命名）'
+          const reason = typeof row.reason === 'string' && row.reason !== '' ? row.reason : '未知原因'
+          return name + '：' + reason
+        })
+        return shown.join('；') + (rows.length > shown.length ? '；等 ' + String(rows.length) + ' 条' : '')
+      }
+
+      /** 选一个 JSON 文件，交给回调处理（回调自己负责 busy 与反馈）。 */
+      const pickJsonFile = function (onPick) {
         const input = document.createElement('input')
         input.type = 'file'
         input.accept = '.json,application/json'
-        input.onchange = async function () {
+        input.onchange = function () {
           const file = input.files && input.files[0]
-          if (file === undefined || file === null) return
-          setBusy(true); setError(null)
-          try {
-            const messages = messagesOfImport(await file.text())
-            await api('import-session', undefined, { sessionId: sessionId, messages: messages })
-            await loadHistory()
-          } catch (caught) { setError(String(caught && caught.message ? caught.message : caught)) }
-          finally { setBusy(false) }
+          if (file === undefined || file === null) return undefined
+          // 返回 promise 只是方便测试里 await（浏览器会忽略 onchange 的返回值）
+          return onPick(file)
         }
         input.click()
+      }
+
+      /** 导入结果反馈：面板里留一条常驻说明，同时弹一次提示条。 */
+      const noteImport = function (text) {
+        setImportNotice(text)
+        showQueuedNotice(text)
+      }
+
+      /** 目录下拉当前选中项的名字，用于反馈里说清写到哪儿了。 */
+      const currentRootLabel = function () {
+        const roots = status !== null && status !== undefined && Array.isArray(status.roots) ? status.roots : []
+        const hit = roots.find(function (item) {
+          return item !== null && typeof item === 'object' && item.index === newRoot
+        })
+        return hit !== undefined && typeof hit.label === 'string' && hit.label !== '' ? hit.label : String(newRoot)
+      }
+
+      /** 导入成手动上下文条目：落到目录下拉选中的那个目录。 */
+      const importEntriesRun = async function (file) {
+        if (sessionId === null || sessionId === '') return
+        setBusy(true); setError(null); setImportNotice(null)
+        try {
+          const parsed = parseImportFile(await file.text())
+          const fromMessages = parsed.entries.length === 0
+          const entries = fromMessages ? entriesFromMessages(parsed.messages) : parsed.entries
+          if (entries.length === 0) {
+            throw new Error('这个文件里没有条目：需要 entries: [{ name, body }] 或 messages 数组；想导入成历史消息请选另一个目标')
+          }
+          const value = await api('import-entries', undefined, {
+            sessionId: sessionId, rootIndex: newRoot, entries: entries,
+          })
+          if (value !== null && typeof value === 'object' && value.queued === true) {
+            setImportNotice('导入已排队：' + String(value.message ?? '下一次对话开始时自动应用'))
+            return
+          }
+          // written 目前是「写成功的条目 id 数组」，也兼容直接给条数的实现
+          const written = Array.isArray(value && value.written)
+            ? value.written.length
+            : (Number.isFinite(value && value.written) ? value.written : 0)
+          const skipped = value !== null && typeof value === 'object' && Array.isArray(value.skipped) ? value.skipped : []
+          let text = '已导入 ' + String(written) + ' 条到「' + currentRootLabel() + '」'
+          if (fromMessages) text += '（由 ' + String(entries.length) + ' 条消息转成条目）'
+          if (skipped.length > 0) text += '；跳过 ' + String(skipped.length) + ' 条：' + skipReasonText(skipped)
+          noteImport(text)
+          await loadContext()
+        } catch (caught) {
+          const message = String(caught && caught.message ? caught.message : caught)
+          setError(message)
+          showQueuedNotice('导入失败：' + message)
+        } finally { setBusy(false) }
+      }
+
+      /** 导入成当前会话的历史消息：追加到历史末尾（按 message.id 去重）。 */
+      const importSessionRun = async function (file) {
+        if (sessionId === null || sessionId === '') return
+        setBusy(true); setError(null); setImportNotice(null)
+        try {
+          const parsed = parseImportFile(await file.text())
+          const fromEntries = parsed.messages.length === 0 && parsed.entries.length > 0
+          const messages = parsed.messages.length > 0 ? parsed.messages : messagesFromEntries(parsed.entries)
+          if (messages.length === 0) {
+            throw new Error('这个文件里没有消息：需要 messages 数组或 entries: [{ name, body }]；想导入成条目请选另一个目标')
+          }
+          const value = await api('import-session', undefined, { sessionId: sessionId, messages: messages })
+          if (value !== null && typeof value === 'object' && value.queued === true) {
+            setImportNotice('导入已排队：' + String(value.message ?? '下一次对话开始时自动应用'))
+            return
+          }
+          const imported = Number.isFinite(value && value.imported) ? value.imported : 0
+          const skipped = Number.isFinite(value && value.skipped) ? value.skipped : 0
+          let text = fromEntries
+            ? '已把 ' + String(messages.length) + ' 个条目当成历史消息导入 ' + String(imported) + ' 条'
+            : '已导入 ' + String(imported) + ' 条历史消息'
+          if (skipped > 0) text += '；跳过 ' + String(skipped) + ' 条（消息 id 已存在，重复导入不会翻倍）'
+          noteImport(text)
+          await loadHistory()
+        } catch (caught) {
+          const message = String(caught && caught.message ? caught.message : caught)
+          setError(message)
+          showQueuedNotice('导入失败：' + message)
+        } finally { setBusy(false) }
+      }
+
+      /** 历史页的「导入」按钮：直接按历史消息导入。 */
+      const pickImportFile = function () {
+        if (sessionId === null || sessionId === '') return
+        pickJsonFile(importSessionRun)
       }
 
       const createFile = async function () {
@@ -1367,7 +1505,36 @@ window.__ModuleLoader__.load({
               className: 'mc-select', value: newRole, title: '注入到上下文时模拟的消息类型',
               onChange: function (event) { setNewRole(event.target.value) },
             }, roleOptions()),
+            // 单独的「导入」按钮：点开先选导入目标（条目 / 历史消息），再挑文件
+            h('button', {
+              className: 'mc-btn', 'data-primary': String(importPick),
+              title: '从 JSON 文件导入：可以导入成手动上下文条目（写到上面选的目录），也可以导入成当前会话的历史消息',
+              onClick: function () { setImportPick(!importPick); setImportNotice(null) },
+              disabled: busy || sessionId === null,
+            }, '导入'),
           ),
+          importPick
+            ? h('div', { className: 'mc-row', style: { marginBottom: '6px' } },
+              h('span', { className: 'mc-sub' }, '导入成：'),
+              h('button', {
+                className: 'mc-btn',
+                title: '选 JSON 文件（entries: [{ name, body }]，或 messages 数组自动转成条目），每个条目写成一个 .md 落到上面选的目录',
+                onClick: function () { setImportPick(false); pickJsonFile(importEntriesRun) },
+                disabled: busy || sessionId === null,
+              }, '导入成手动上下文条目'),
+              h('button', {
+                className: 'mc-btn',
+                title: '选 JSON 文件（messages 数组或 entries），把消息追加到当前会话历史末尾（按消息 id 去重）',
+                onClick: function () { setImportPick(false); pickJsonFile(importSessionRun) },
+                disabled: busy || sessionId === null,
+              }, '导入成当前会话的历史消息'),
+              h('button', {
+                className: 'mc-btn', title: '收起导入选项',
+                onClick: function () { setImportPick(false) },
+              }, '取消'),
+            )
+            : null,
+          importNotice === null ? null : h('div', { className: 'mc-note', style: { marginBottom: '10px' } }, importNotice),
           h('div', { className: 'mc-row', style: { marginBottom: '10px' } },
             h('input', {
               className: 'mc-input', placeholder: '新建条目名，如 项目约定', value: newName,
@@ -1984,7 +2151,7 @@ window.__ModuleLoader__.load({
               onClick: function () { void exportSessionFile() }, disabled: busy || sessionId === null,
             }, '导出'),
             h('button', {
-              className: 'mc-btn', title: '从 JSON 导入对话，追加到当前会话末尾（按消息 id 去重）',
+              className: 'mc-btn', title: '从 JSON 导入对话，追加到当前会话末尾（按消息 id 去重；也接受 { entries } 形态）',
               onClick: pickImportFile, disabled: busy || sessionId === null,
             }, '导入'),
           ),
