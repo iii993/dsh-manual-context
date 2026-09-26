@@ -76,8 +76,11 @@ const normalizeRoleOf = normalizeRole
 /**
  * 把当前所有**启用**的条目展开成会话里应有的目标节点列表（已按权重排好序）。
  */
-export function planTargets(cwd) {
+export function planTargets(cwd, warnings) {
   const targets = []
+  const note = function (text) {
+    if (Array.isArray(warnings)) warnings.push(text)
+  }
   // tool 轨迹的 callId 跨条目配对：result 段要能接上前面 call 段的 callId
   const pendingCalls = []
   for (const meta of listEntries(cwd)) {
@@ -130,9 +133,16 @@ export function planTargets(cwd) {
         continue
       }
       if (spec.role === 'tool-result') {
-        const callId = spec.callId !== undefined && spec.callId !== ''
-          ? spec.callId
-          : (pendingCalls.length > 0 ? pendingCalls.shift() : 'manual-call-' + entry.hash + '-r' + String(spec.index))
+        const explicit = spec.callId !== undefined && spec.callId !== ''
+        const inherited = pendingCalls.length > 0 ? pendingCalls.shift() : null
+        const callId = explicit ? spec.callId : inherited
+        if (callId === null) {
+          // 前面没有可配对的「工具调用」时，以前会现造一个 callId —— 模型侧会直接拒
+          // （tool result has no matching call）。这里整段跳过并如实报告，不把坏轨迹注进去。
+          note(entry.name + ' 的第 ' + String(spec.index + 1) + ' 段是「工具返回」，'
+            + '但前面没有可配对的「工具调用」（也不在段上写 callId 指定），本次已跳过。')
+          continue
+        }
         targets.push({ ...base, id: spec.id, index: spec.index, role: 'tool-result', text: spec.text, callId, isError: spec.isError === true })
       }
     }
@@ -298,7 +308,10 @@ export function syncManualContext(ctx, sessionId) {
     }
   }
 
-  const targets = planTargets(cwd)
+  // 收集「没法安全注入」的段（例如没有配对工具调用的工具返回），如实带回给面板，
+  // 而不是静默丢掉或者硬塞一个配不上的 callId 进去。
+  const warnings = []
+  const targets = planTargets(cwd, warnings)
   const present = manualContextNodes(session)
   const wanted = new Set(targets.map(function (item) { return item.id }))
   const removed = []
@@ -343,6 +356,7 @@ export function syncManualContext(ctx, sessionId) {
     reordered,
     total: targets.length,
     deferred: deferred.length,
+    warnings,
   }
 }
 

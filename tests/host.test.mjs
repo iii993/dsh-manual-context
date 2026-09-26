@@ -221,6 +221,19 @@ test('权重决定位置：<=0 紧跟系统提示词，>0 排在对话末尾', (
   assert.ok(String(ids[ids.length - 1]).indexOf('manual-context:') === 0, '尾部条目在最后')
 })
 
+test('手动上下文：没有配对工具调用的工具返回会被跳过并如实报告', () => {
+  // 以前这里会给孤儿工具返回现造一个 callId，注进去之后模型侧直接拒
+  // （DeepSeek Messages tool result has no matching call）。
+  const cwd = join(sandbox, 'orphan-tool-result')
+  const NL = String.fromCharCode(10)
+  store.createEntry(cwd, 'orphan', ['---', 'role: tool-result', '---', '孤立的返回'].join(NL))
+  const warnings = []
+  const targets = inject.planTargets(cwd, warnings)
+  assert.equal(targets.length, 0, '不该凭空造一条配不上的工具返回')
+  assert.equal(warnings.length, 1, '要如实报告被跳过的段')
+  assert.match(warnings[0], /没有可配对的「工具调用」/)
+})
+
 test('tool-call 与 tool-result 同步成一对（callId 稳定）', () => {
   const cwd = join(sandbox, 'sync-tool')
   const NL = String.fromCharCode(10)

@@ -618,6 +618,14 @@ window.__ModuleLoader__.load({
           const removed = Number.isFinite(value.removed) ? value.removed : 0
           const deferred = Number.isFinite(value.deferred) ? value.deferred : 0
           const total = Number.isFinite(value.total) ? value.total : 0
+          // 没法安全注入的段（例如没有配对工具调用的工具返回）会被跳过，这里如实显示。
+          const warnings = value !== null && typeof value === 'object' && Array.isArray(value.warnings)
+            ? value.warnings.filter(function (item) { return typeof item === 'string' && item !== '' })
+            : []
+          if (warnings.length > 0) {
+            setError(warnings.join(' '))
+            return
+          }
           const idle = value !== null && typeof value === 'object' && value.idle === true
           if (idle) {
             // 空闲时写入会把节点排在系统提示词前面，会话下次就打不开了 —— 一律排队。
