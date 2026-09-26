@@ -581,6 +581,34 @@ test('appendMessage: 工具调用生成 tool-call 块与 JSON 字符串参数', 
   assert.equal(appended[0].data.stream[0].type, 'tool-call-chunks')
 })
 
+test('编辑 v4 会话的工具返回：必须写成 role:tool，不能退回 role:user', () => {
+  // 回归：replaceInPlace 曾经漏传 version，导致 v4 的 tool/result 按 v3 老形状补成 user，
+  // 然后被自己的守卫拦下（"tool/result 的消息角色必须是 tool（实际 user）"）。
+  const cwd = join(sandbox, 'edit-tool-result-v4')
+  const built = contextSession(cwd, { version: 4 })
+  const event = {
+    type: 'tool/result', seq: built.log.length, time: 0,
+    data: {
+      turn: 1, step: 1,
+      message: {
+        id: 'tool-1', role: 'tool',
+        content: [{ type: 'text', text: '原来的文件内容' }],
+        source: { kind: 'tool', callId: 'call-1' },
+        toolCallId: 'call-1',
+      },
+    },
+    surfaceOp: 'append',
+  }
+  built.log.push(event)
+  built.surfaceNodes.push(event.seq)
+  history.applyEdit(built.ctx, 'session-context', event.seq, '改过的文件内容')
+  const written = built.appended[built.appended.length - 1]
+  assert.equal(written.type, 'tool/result')
+  assert.equal(written.data.message.role, 'tool', 'v4 的 tool/result 必须 role:tool')
+  assert.equal(written.data.message.source.kind, 'tool')
+  assert.equal(written.data.message.content[0].text, '改过的文件内容')
+})
+
 test('appendMessage: 工具返回构造 tool/result 且 callId 自洽', () => {
   const { ctx, appended } = appendHarness()
   const result = history.appendMessage(ctx, 'session-append', { kind: 'tool-result', text: '文件内容', callId: 'call-1' })

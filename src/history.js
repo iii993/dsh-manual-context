@@ -553,11 +553,14 @@ function blankOut(session, seq, position, tag) {
 function replaceInPlace(session, seq, target, original, content, identity) {
   const type = target.type
   const version = sessionFormatVersion(session)
+  // version 必须一起传：v4 的 tool/result 是 role:'tool' 的一等消息，
+  // 少了它就会按 v3 的老形状补成 role:'user'，然后被自己的 assertWritableEvent 拦下
+  // （"tool/result 的消息角色必须是 tool（实际 user）"）。
   const message = normalizeForWrite(type, {
     ...(original !== null && typeof original === 'object' ? original : {}),
     id: 'manual-context-edit:' + randomUUID(),
     content,
-  }, identity)
+  }, identity, version)
   const data = target.data !== null && typeof target.data === 'object' ? target.data : {}
   const payload = type === 'user/message' ? message : { ...data, message }
   assertWritableEvent(type, payload, version)
