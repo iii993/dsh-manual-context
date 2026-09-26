@@ -1264,13 +1264,13 @@ test('user 与 tool/result 仍是原位替换，不触发重放', () => {
 test('重放超过上限时直接拒绝，不留下半截日志', () => {
   const events = [sysEvent(0, 'sys')]
   const nodes = [0]
-  for (let i = 1; i <= 305; i += 1) {
+  for (let i = 1; i <= 2001; i += 1) {
     events.push(i === 1 ? assistantEvent(i, '第一条回答', 'c1', 't') : userEvent(i, 'm' + String(i)))
     nodes.push(i)
   }
   const built = movableSession(events, nodes)
   const ctx = { sessions: { get: () => built.session } }
-  assert.throws(() => history.applyEdit(ctx, 'session-move', 1, '改'), /重放整段历史/)
+  assert.throws(() => history.applyEdit(ctx, 'session-move', 1, '改'), /单次上限/)
   assert.equal(built.appended.length, 0, '拒绝时一个事件都不该写')
 })
 

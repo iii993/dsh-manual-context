@@ -581,8 +581,17 @@ function replaceInPlace(session, seq, target, original, content, identity) {
   })
 }
 
-/** 一次重放最多允许改写的尾部长度（再多就该换个改法了）。 */
-const REPLAY_LIMIT = 300
+/**
+ * 一次重放最多允许改写的尾部长度。
+ *
+ * 模型输出（assistant/message）在 dsh 里**无条件**不允许携带 sourceEventSeqs
+ * （dsh-session 的 assertSourceEventReferences），而那是 surface 替换的必需标记 ——
+ * 所以改写它只有「遮蔽原节点 + 按原顺序重新追加」这一条合法路径，尾部多长就得重放多长。
+ *
+ * 这个上限只是防止一次操作把日志撑爆的护栏，不是 dsh 的限制：放宽到 2000，
+ * 真超了也照实说明要重放多少条，让用户自己决定。
+ */
+const REPLAY_LIMIT = 2000
 
 /**
  * 改写一条 **assistant** 消息。
@@ -598,8 +607,11 @@ function replayTail(session, nodes, seq, content, identity) {
   if (at < 0) throw new Error('该消息已不在当前模型可见上下文中（可能已被压缩），无法直接替换')
   const tail = nodes.slice(at)
   if (tail.length > REPLAY_LIMIT) {
-    throw new Error('这条消息后面还有 ' + String(tail.length - 1) + ' 条消息，改写它需要重放整段历史。'
-      + '请改更靠后的消息，或者先把它删掉再在末尾追加。')
+    // 只在这条真的长到会拖垮日志时才拒绝，并把「为什么要重放、重放多少条」说清楚。
+    throw new Error('这条消息后面还有 ' + String(tail.length - 1) + ' 条，改写模型输出必须把它们整段重放'
+      + '（dsh 规定 assistant/message 不能做原位替换，只能遮蔽后按原顺序重新追加）。'
+      + '单次上限是 ' + String(REPLAY_LIMIT) + ' 条，超过了。'
+      + '可以先把靠后的历史删掉一些，或者改更靠后的消息。')
   }
   const events = sessionEvents(session)
   const position = writablePosition(session, 'system')
