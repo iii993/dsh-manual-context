@@ -1,3 +1,4 @@
+import { homedir } from 'node:os'
 /**
  * 修复插件旧版写坏的「非法遮蔽事件」——只动真正导致会话打不开的那些。
  *
@@ -27,7 +28,7 @@ const validateStoredEvents = persistence.validateStoredEvents
 
 const PLUGIN_KIND = 'plugin:@dsh-external/manual-context'
 const apply = process.argv.includes('--apply')
-const root = process.argv.slice(2).find(a => a !== '--apply') ?? 'H:/dsh-home/sessions'
+const root = process.argv.slice(2).find(a => a !== '--apply') ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'sessions')
 
 function readLines(file) {
   const buffer = fs.readFileSync(file)

@@ -12,7 +12,7 @@
  * 因此修改状态独立于上下文压缩而保留，压缩后仍可查看与再次应用。
  */
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { freezeMessage, messageText, messageReasoning, hasReasoning, messageToolCalls, toolResultText } from './freeze.js'
 import { dshHome } from './store.js'
@@ -44,6 +44,22 @@ export class SessionWritePendingError extends Error {
 /** 编辑记录落盘目录。 */
 export function editsDir() {
   return join(dshHome(), EDIT_DIR_NAME)
+}
+
+/**
+ * 把排队操作的应用结果追加到队列目录旁的 apply.log。
+ *
+ * 「一直显示排队中、对话里却没注入」这类问题只看队列文件看不出原因，
+ * 有了这份流水就能直接看到每次尝试的结果与失败原因。
+ */
+export function appendApplyLog(sessionId, text) {
+  try {
+    const dir = editsDir()
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    appendFileSync(join(dir, 'apply.log'), new Date().toISOString() + ' [' + sessionId + '] ' + text + '\n', 'utf8')
+  } catch {
+    // 记日志失败不影响主流程
+  }
 }
 
 function editsFile(sessionId) {
@@ -257,6 +273,14 @@ export function listHistoryMessages(ctx, sessionId) {
   const nodes = [...session.surface.nodes]
   const edits = loadEdits(sessionId)
   const editedSeqs = new Set(edits.map(edit => edit.replacedSeq))
+  // 排队中的删除：这些节点还在 surface 上，但下一次请求组装时会被摘掉。
+  // 面板要如实标出来，否则用户分不清「删掉了」和「排着队还没删」。
+  const queued = loadQueue(sessionId)
+  const pendingDeletes = new Set()
+  for (const operation of queued) {
+    if (operation?.op !== 'delete-messages') continue
+    for (const target of operation?.payload?.seqs ?? []) if (Number.isSafeInteger(target)) pendingDeletes.add(target)
+  }
   const messages = []
   for (const seq of nodes) {
     const event = events[seq]
@@ -284,10 +308,11 @@ export function listHistoryMessages(ctx, sessionId) {
       toolCalls: messageToolCalls(message),
       edited: editedSeqs.has(seq),
       editedAt: edits.find(edit => edit.replacedSeq === seq)?.updatedAt ?? null,
+      pendingDelete: pendingDeletes.has(seq),
       protected: nodes[0] === seq && event.type === 'system/message',
     })
   }
-  return { sessionId, nodes, messages, edits }
+  return { sessionId, nodes, messages, edits, queued }
 }
 
 /** 保留原有块结构，只把文本内容换成新值。 */
@@ -721,36 +746,23 @@ function writePosition(session, options) {
 }
 
 /**
- * 取本次写入要用的 turn/step 坐标。
+ * 取本次写入要用的 turn/step 坐标 —— 和历史编辑**完全同一条路**。
  *
- * 会话格式 v4 之前，表面事件必须落在**开放的 turn/step** 内，否则下次加载时
- * v3→v4 迁移器会拒绝整份日志（表现为「会话打不开」）。所以旧格式只能等
- * 下一轮请求（step 打开）再写，空闲时抛 SessionWritePendingError 交给上层排队。
+ * 会话空闲（上一次 turn/end 之后、或新建对话还没开始）时没有开放的 turn/step，
+ * 写进去的表面事件会落在 turn 之外，会话下次就打不开（本轮坏掉的那几个会话
+ * 就是这么来的）。所以这里一律抛 SessionWritePendingError，由 HTTP 层排队、
+ * 等下一轮 agent/request（step 已经打开）再写。
  *
- * v4 起加载校验不再检查这层关系（实测：turn 外的 user/assistant 事件都能通过
- * 迁移 + surface 折叠 + 存储校验），因此**空闲时也允许写入**，坐标回退到
- * 日志里最后一次出现的 turn/step —— 这样新建对话还没开始时也能先注入上下文。
+ * 曾经这里对 v4 做过「坐标回退到日志里最后一次出现的 turn/step」的放行，
+ * 那是错的：v4 一样会校验 turn 关系，放行只会写出打不开的日志。
  */
-function writablePosition(session, kind) {
-  if (kind === 'user') return { turn: 0, step: 1 }
-  try {
-    const open = writePosition(session)
-    return { turn: open.turn, step: open.step }
-  } catch (error) {
-    if (sessionFormatVersion(session) < 4) throw error
-    return lastSeenPosition(session)
-  }
-}
-
-/** 日志里最后一次出现的 turn/step；完全没有坐标时退回 turn 1 / step 1。 */
-function lastSeenPosition(session) {
-  const events = sessionEvents(session)
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const data = events[index]?.data
-    if (data === null || typeof data !== 'object') continue
-    if (Number.isSafeInteger(data.turn) && Number.isSafeInteger(data.step)) return { turn: data.turn, step: data.step }
-  }
-  return { turn: 1, step: 1 }
+function writablePosition(session) {
+  // 注意：user/message 在 v4 里确实不要求 turn/step 关系，空闲时也写得进去 ——
+  // 但它会成为 surface 的第一个节点，等系统提示词随后写进来，整份日志就通不过
+  // 「system/message requires a protected first surface head」。所以这里**所有**类型
+  // 一视同仁：没有开放的 turn/step 就抛 SessionWritePendingError，交给上层排队。
+  const open = writePosition(session)
+  return { turn: open.turn, step: open.step }
 }
 
 function modelIdentity(agent) {
@@ -779,7 +791,7 @@ export function appendMessage(ctx, sessionId, spec) {
   if (kind !== 'tool-call' && blocks.length === 0 && text.trim() === '') throw new Error('内容不能为空')
   // user/message 随时可写；其余表面事件必须在**当前开放**的 turn/step 内。
   // 不再采纳调用方传入的 turn/step —— 那些坐标正是空闲注入写出坏日志的原因。
-  const position = writablePosition(session, kind)
+  const position = writablePosition(session)
   const agent = spec?.agent ?? (ctx.agents?.list?.() ?? []).find(item => item.id === sessionId)
   const identity = modelIdentity(agent)
   // 消息 id 可由调用方指定：手动上下文用它承载条目 hash，从而无需污染正文即可去重。

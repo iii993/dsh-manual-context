@@ -282,7 +282,9 @@ test('user 段与 tool-result 段会打断合并', () => {
   assert.equal(built.appended[2].data.message.content[0].text, 'B')
 })
 
-test('旧格式会话空闲时：能写的先写，写不进去的排队（不再整次失败）', () => {
+test('会话空闲时一律排队，不直接写日志', () => {
+  // 空闲时写进去的节点会成为 surface 的第一个节点，等系统提示词随后写进来，
+  // 日志就通不过 v4 的关系校验（对话重开一片空白）—— 所以空闲只排队。
   const cwd = join(sandbox, 'sync-idle')
   const NL = String.fromCharCode(10)
   store.createEntry(cwd, 'rule', ['---', 'role: assistant', '---', '模型输出类'].join(NL))
@@ -290,24 +292,21 @@ test('旧格式会话空闲时：能写的先写，写不进去的排队（不�
   const built = contextSession(cwd, { open: false })
   seedSystem(built, 'sys')
   const result = inject.syncManualContext(built.ctx, 'session-context')
-  assert.equal(result.added, 1, 'user 段先写下去')
-  assert.equal(result.deferred, 1, 'assistant 段排队等下一轮')
-  assert.equal(built.appended.length, 1)
-  assert.equal(built.appended[0].type, 'user/message')
+  assert.equal(result.added, 0, '空闲时不写日志')
+  assert.equal(result.deferred, 2, '两段都排队等下一轮')
+  assert.equal(built.appended.length, 0)
 })
 
-test('v4 会话空闲时也能注入（新建对话还没开始就能用）', () => {
+test('v4 会话空闲时也只排队（空闲写进去的节点会压在系统提示词前面）', () => {
   const cwd = join(sandbox, 'sync-idle-v4')
   const NL = String.fromCharCode(10)
   store.createEntry(cwd, 'rule', ['---', 'role: assistant', '---', '模型输出类'].join(NL))
   const built = contextSession(cwd, { open: false, version: 4 })
   seedSystem(built, 'sys')
   const result = inject.syncManualContext(built.ctx, 'session-context')
-  assert.equal(result.deferred, 0, 'v4 加载校验不检查 turn 关系，空闲也能写')
-  assert.equal(result.added, 1)
-  assert.equal(built.appended[0].type, 'assistant/message')
-  assert.equal(built.appended[0].data.turn, 1, '坐标回退到日志里最后一次出现的 turn/step')
-  assert.equal(built.appended[0].data.step, 1)
+  assert.equal(result.deferred, 1, '空闲写进去会落在 turn 之外，必须排队')
+  assert.equal(result.added, 0)
+  assert.equal(built.appended.length, 0)
 })
 
 test('pre-step 只排队同步，不直接写日志', async () => {

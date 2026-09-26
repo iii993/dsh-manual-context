@@ -162,6 +162,64 @@ test('选中消息后在右侧渲染完整内容与编辑按钮', () => {
   assert.ok(all.includes('清除标记'))
 })
 
+test('排队中的改动在列表里可见：将被删除 / 将被添加', () => {
+  // 排队还没写进日志的改动以前在面板上完全隐形 —— 既不知道排了什么，也没法改。
+  const messages = MESSAGES.map(function (message, index) {
+    return index === 2 ? Object.assign({}, message, { pendingDelete: true }) : message
+  })
+  const tree = render({
+    0: true, 1: 'history', 11: 0,
+    9: {
+      messages, edits: [], nodes: [0, 1, 2],
+      pendingAdds: [{ queueIndex: 0, source: 'append', kind: 'user', text: '还没写进去的补充', editable: true }],
+    },
+  })
+  const all = texts(tree)
+  assert.ok(all.includes('将被删除'), '被删除的消息要有标签')
+  assert.ok(all.includes('将被添加'), '待添加的条目要列出来')
+  assert.ok(all.some(t => t.includes('还没写进去的补充')), '待添加的正文要能看到')
+  assert.ok(all.includes('编辑'), '面板追加的消息要能就地改写')
+  assert.ok(all.includes('丢弃'))
+})
+
+test('待添加的条目按历史同款显示思维链与工具调用', () => {
+  const tree = render({
+    0: true, 1: 'history', 11: 0,
+    9: {
+      messages: MESSAGES, edits: [], nodes: [0, 1, 2],
+      pendingAdds: [{
+        queueIndex: 0, source: 'append', kind: 'assistant', text: '正文内容',
+        reasoning: '先想一想', toolName: 'read_file', toolInput: '{"path":"a"}', editable: true,
+      }],
+    },
+  })
+  const all = texts(tree)
+  assert.ok(all.includes('思维链（reasoning 块）'), '思维链要单独成块，和历史里一样')
+  assert.ok(all.includes('先想一想'))
+  assert.ok(all.includes('正文内容'))
+  assert.ok(all.some(t => t.includes('工具调用：read_file')), '工具调用也要显示出来')
+  assert.ok(byClass(tree, 'mc-hitem').length >= 2, '卡片用历史同款样式')
+})
+
+test('排队中的手动上下文段只提示去条目页改', () => {
+  const tree = render({
+    0: true, 1: 'history', 11: 0,
+    9: {
+      messages: MESSAGES, edits: [], nodes: [0, 1, 2],
+      pendingAdds: [{ queueIndex: 1, source: 'manual-context', kind: 'assistant', text: '条目正文', entryName: 'note.md', editable: false }],
+    },
+  })
+  const all = texts(tree)
+  assert.ok(all.includes('将被添加 · 手动上下文'))
+  assert.ok(all.some(t => t.includes('note.md')))
+  assert.ok(all.some(t => t.includes('去「手动上下文」页改')), '内容在文件里，不能在这里直接改')
+})
+
+test('没有排队改动时不显示排队区块', () => {
+  const tree = render({ 0: true, 1: 'history', 9: { messages: MESSAGES, edits: [], nodes: [0, 1, 2] }, 11: 0 })
+  assert.equal(texts(tree).some(t => t.includes('将被添加')), false)
+})
+
 test('系统头的保护提示只在选中它时出现', () => {
   const tree = render({ 0: true, 1: 'history', 9: { messages: MESSAGES, edits: [], nodes: [0, 1, 2] }, 11: 0 })
   assert.equal(byClass(tree, 'mc-fulltext')[0].children[0], '你是助手')

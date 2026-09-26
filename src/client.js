@@ -47,6 +47,12 @@ window.__ModuleLoader__.load({
       '.mc-item:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.mc-item[data-on="true"]{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}',
       '.mc-badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;font-size:11px;background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary)}',
+      '.mc-badge[data-pending="delete"]{background:var(--dsw-alias-state-error-tertiary);color:var(--dsw-alias-state-error-primary)}',
+      '.mc-badge[data-pending="add"]{background:var(--dsw-alias-state-success-tertiary);color:var(--dsw-alias-state-success-primary)}',
+      '.mc-item[data-pending="add"]{border-style:dashed}',
+      '.mc-item.mc-pending{overflow:visible;cursor:default}',
+      '.mc-pending-text{margin-top:4px;padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}',
+      '.mc-pending-ta{width:100%;box-sizing:border-box;min-height:120px;margin-top:4px;resize:vertical;padding:8px 10px;border:1px solid var(--dsw-alias-state-business-primary);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:1.6;font-family:inherit}',
       '.mc-main{flex:1;display:flex;flex-direction:column;min-height:0;min-width:0;padding:12px 16px;gap:10px}',
       '.mc-ta{flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.6}',
       '.mc-ta:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}',
@@ -291,6 +297,14 @@ window.__ModuleLoader__.load({
       const [segDirty, setSegDirty] = useState(false)
       const [dragSegIndex, setDragSegIndex] = useState(null)
       const [dragOverSegIndex, setDragOverSegIndex] = useState(null)
+      // 新增状态一律追加在最后：渲染测试（tests/client.test.mjs）按 useState 的调用序号
+      // 覆盖初值，插在中间会让后面所有状态错位。
+      const [pendingEdit, setPendingEdit] = useState(null)
+      const [pendingDraft, setPendingDraft] = useState('')
+      const [pendingReasoning, setPendingReasoning] = useState('')
+      const [pendingToolName, setPendingToolName] = useState('')
+      const [pendingToolInput, setPendingToolInput] = useState('')
+      const [composeReasoning, setComposeReasoning] = useState('')
       const mounted = useRef(true)
 
       /** 片段生效的角色：段标记 > 文件 frontmatter > user。 */
@@ -604,7 +618,13 @@ window.__ModuleLoader__.load({
           const removed = Number.isFinite(value.removed) ? value.removed : 0
           const deferred = Number.isFinite(value.deferred) ? value.deferred : 0
           const total = Number.isFinite(value.total) ? value.total : 0
-          if (deferred > 0) {
+          const idle = value !== null && typeof value === 'object' && value.idle === true
+          if (idle) {
+            // 空闲时写入会把节点排在系统提示词前面，会话下次就打不开了 —— 一律排队。
+            showQueuedNotice(deferred > 0
+              ? '会话当前空闲：改动已排队，下一次对话开始时自动注入（空闲直接写会让对话打不开）。'
+              : '会话当前空闲，没有需要改动的节点。')
+          } else if (deferred > 0) {
             showQueuedNotice('已注入 ' + String(added) + ' 段，还有 ' + String(deferred)
               + ' 段在排队：这段会话是 v4 之前的旧格式，下一次对话开始时自动补上。')
           } else {
@@ -634,11 +654,17 @@ window.__ModuleLoader__.load({
         finally { setBusy(false) }
       }
 
-      /** 一键修复：把旧版插件写坏的会话日志修好（「对话打不开、界面空白」的根因）。 */
-      const repairAll = async function () {
+      /**
+       * 修复会话日志（「对话点开一片空白」的根因）。
+       *
+       * onlySession 非空时只处理那一个对话 —— 会话日志是逐个损坏的，没必要每次都把
+       * 全部会话扫一遍；不传才是全量扫描。
+       */
+      const repairSessionsRun = async function (onlySession) {
         setBusy(true); setError(null)
         try {
-          const value = await api('repair-sessions', undefined, { apply: true })
+          const target = onlySession === null || onlySession === '' ? undefined : onlySession
+          const value = await api('repair-sessions', target, { apply: true, sessionId: target })
           if (value === null || typeof value !== 'object' || value.ok === false) {
             throw new Error(String(value !== null && typeof value === 'object' && value.error ? value.error : '修复失败'))
           }
@@ -646,15 +672,28 @@ window.__ModuleLoader__.load({
           const broken = Number.isFinite(value.broken) ? value.broken : 0
           const repaired = Number.isFinite(value.repaired) ? value.repaired : 0
           const skipped = Number.isFinite(value.skippedRunning) ? value.skippedRunning : 0
-          showQueuedNotice(broken === 0
-            ? '扫描 ' + String(scanned) + ' 个会话，没有需要修复的。'
-            : '扫描 ' + String(scanned) + ' 个会话：修好 ' + String(repaired) + ' 个'
-              + (skipped > 0 ? '，跳过 ' + String(skipped) + ' 个运行中的' : '')
-              + '。原文件备份为 *.corrupt-bak，重启 dsh 后打开即可。')
+          const rows = Array.isArray(value.sessions) ? value.sessions : []
+          const stuck = rows.filter(function (row) { return row !== null && typeof row === 'object' && typeof row.reason === 'string' })
+          if (broken === 0) {
+            showQueuedNotice(target === undefined
+              ? '扫描 ' + String(scanned) + ' 个对话，全都打得开，没有要修的。'
+              : '这个对话的日志没问题，不用修。')
+          } else if (stuck.length === 0) {
+            showQueuedNotice('修好 ' + String(repaired) + ' 个对话'
+              + (skipped > 0 ? '（跳过 ' + String(skipped) + ' 个正在运行的）' : '')
+              + '。原文件已备份为 *.corrupt-bak，重启 dsh 后就能打开。')
+          } else {
+            showQueuedNotice('修好 ' + String(repaired) + ' 个，还有 ' + String(stuck.length)
+              + ' 个需要另一种修法：' + String(stuck[0].reason ?? '').slice(0, 70))
+          }
           await loadContext()
         } catch (caught) { setError(String(caught && caught.message ? caught.message : caught)) }
         finally { setBusy(false) }
       }
+      /** 只修当前选中的对话。 */
+      const repairCurrent = function () { void repairSessionsRun(sessionId) }
+      /** 扫描全部对话并修复。 */
+      const repairAll = function () { void repairSessionsRun(null) }
 
       /** 导出当前会话（含手动上下文节点）为 JSON 文件。 */
       const exportSessionFile = async function () {
@@ -797,6 +836,44 @@ window.__ModuleLoader__.load({
         })
       }
 
+      /**
+       * 改写一条「排着队、还没写进去」的消息正文。
+       *
+       * 这是「将要添加进对话的内容改不了」的补丁：以前排队中的追加在面板上完全隐形，
+       * 只能等它写进去以后才看得见、才改得动。
+       */
+      const savePendingAdd = async function (queueIndex, text) {
+        if (sessionId === null || sessionId === '') return
+        setBusy(true); setError(null)
+        try {
+          await api('edit-pending', undefined, {
+            sessionId: sessionId,
+            queueIndex: queueIndex,
+            text: text,
+            reasoning: pendingReasoning,
+            toolName: pendingToolName,
+            toolInput: pendingToolInput,
+          })
+          setPendingEdit(null)
+          showQueuedNotice('已改写排队中的内容；下一次对话开始时按新内容加进去。')
+          await loadHistory()
+        } catch (caught) { setError(String(caught && caught.message ? caught.message : caught)) }
+        finally { setBusy(false) }
+      }
+
+      /** 丢弃一条排队中的改动（还没写进日志，丢掉不留痕迹）。 */
+      const dropPendingAdd = async function (queueIndex) {
+        if (sessionId === null || sessionId === '') return
+        setBusy(true); setError(null)
+        try {
+          await api('drop-pending', undefined, { sessionId: sessionId, queueIndex: queueIndex })
+          setPendingEdit(null)
+          showQueuedNotice('已丢弃这条排队中的改动。')
+          await loadHistory()
+        } catch (caught) { setError(String(caught && caught.message ? caught.message : caught)) }
+        finally { setBusy(false) }
+      }
+
       /** 把若干条历史消息从模型可见上下文里移除。 */
       const removeMessages = async function (seqs) {
         if (!seqs || seqs.length === 0) return
@@ -824,15 +901,31 @@ window.__ModuleLoader__.load({
       const appendNew = async function () {
         setBusy(true); setError(null)
         try {
+          // 思维链 / 正文 / 工具调用组装成同一条 assistant 消息的多个内容块
+          // （相邻的自动合并，和历史里的形状一致）。
+          // 只有模型输出与工具调用才可能带思维链 —— 用户输入、工具返回本身就是单块消息。
+          const canReason = composeKind === 'assistant' || composeKind === 'tool-call'
+          const withReasoning = canReason && composeReasoning.trim() !== ''
+          const blocks = []
+          if (withReasoning) {
+            blocks.push({ type: 'reasoning', text: composeReasoning })
+            if (composeText.trim() !== '') blocks.push({ type: 'text', text: composeText })
+            if (composeKind === 'tool-call' && composeToolName.trim() !== '') {
+              blocks.push({ type: 'tool-call', name: composeToolName, args: composeToolInput })
+            }
+          }
+          const kind = withReasoning ? 'assistant' : composeKind
           await api('append-message', undefined, {
             sessionId: sessionId,
-            kind: composeKind,
+            kind: kind,
             text: composeText,
+            blocks: blocks.length > 0 ? blocks : undefined,
             toolName: composeToolName,
             toolInput: composeToolInput,
             isError: composeIsError,
           })
           setComposeText('')
+          setComposeReasoning('')
           setComposeToolName('')
           setComposeToolInput('')
           setComposeIsError(false)
@@ -1217,9 +1310,14 @@ window.__ModuleLoader__.load({
             }, status !== null && status.inject === true ? '注入：开' : '注入：关'),
             h('button', {
               className: 'mc-btn',
-              title: '扫描并修复被旧版插件写坏的会话日志 —— 修「对话打不开、点开一片空白」',
-              onClick: function () { void repairAll() }, disabled: busy,
-            }, '修复对话'),
+              title: '只修复当前选中的这个对话 —— 修「对话打不开、点开一片空白」',
+              onClick: repairCurrent, disabled: busy || sessionId === null,
+            }, '修复此对话'),
+            h('button', {
+              className: 'mc-btn',
+              title: '扫描全部对话并修复打不开的那些（会话多时比较慢）',
+              onClick: repairAll, disabled: busy,
+            }, '修复全部'),
             h('button', {
               className: 'mc-btn', 'data-primary': String(entryMulti),
               onClick: function () { setEntryMulti(!entryMulti); setSelectedIds([]) },
@@ -1586,6 +1684,19 @@ window.__ModuleLoader__.load({
             onChange: function (event) { setComposeToolInput(event.target.value) },
           })
           : null,
+        // 思维链只有模型输出才有：用户输入、工具返回不该出现这个字段。
+        composeKind === 'assistant' || composeKind === 'tool-call'
+          ? h(React.Fragment, null,
+            h('div', { className: 'mc-reason-head' }, '思维链（reasoning 块，可留空）'),
+            h('textarea', {
+              className: 'mc-ta mc-reason-ta',
+              placeholder: '留空就不产生思维链块',
+              value: composeReasoning,
+              onChange: function (event) { setComposeReasoning(event.target.value) },
+            }),
+          )
+          : null,
+        h('div', { className: 'mc-reason-head' }, '正文'),
         h('textarea', {
           className: 'mc-ta',
           placeholder: composeKind === 'tool-call' ? '工具调用前的说明文字（可留空）' : '要追加的内容',
@@ -1624,6 +1735,129 @@ window.__ModuleLoader__.load({
         )
       }
 
+      /**
+       * 「排队中 · 将被添加」区块。
+       *
+       * 排队还没写进日志的追加，以前在面板上完全看不见，用户既不知道排了什么、
+       * 也没法改它 —— 这里把它们如实列出来，手动追加的消息还能就地改写。
+       */
+      const pendingRows = (function () {
+        const adds = history !== null && Array.isArray(history.pendingAdds) ? history.pendingAdds : []
+        const deletes = history !== null && Array.isArray(history.messages)
+          ? history.messages.filter(function (message) { return message.pendingDelete === true })
+          : []
+        if (adds.length === 0 && deletes.length === 0) return []
+        const rows = []
+        if (deletes.length > 0) {
+          rows.push(h('div', { className: 'mc-note', key: 'pending-del' },
+            '⏳ 排队中：「' + String(deletes.length) + ' 条消息将在下一次对话开始时被删除」'
+            + '（' + deletes.map(function (message) { return '#' + String(message.seq) }).join('、') + '）'))
+        }
+        for (const item of adds) {
+          // 一次 sync-context 会展开成好几个段、共用一个 queueIndex，所以「正在编辑哪一条」
+          // 不能拿 queueIndex 当身份 —— 否则点一条、全都会变成编辑框。
+          const key = String(item.queueIndex) + '|' + String(item.entryId ?? '') + '|' + String(item.text ?? '').slice(0, 16)
+          const editing = pendingEdit === key
+          const label = item.source === 'manual-context' ? '将被添加 · 手动上下文' : '将被添加'
+          const body = String(item.text ?? '')
+          const reasoning = String(item.reasoning ?? '')
+          const toolName = String(item.toolName ?? '')
+          const toolInput = String(item.toolInput ?? '')
+          rows.push(h('div', { className: 'mc-item mc-hitem', key: 'pending-add-' + key, 'data-pending': 'add' },
+            h('span', { className: 'mc-row', style: { gap: '6px' } },
+              h('span', { className: 'mc-badge', 'data-pending': 'add' }, label),
+              h('span', { className: 'mc-kind', 'data-k': item.kind }, String(item.kind ?? '')),
+              item.entryName !== null && item.entryName !== undefined
+                ? h('span', { className: 'mc-meta' }, String(item.entryName))
+                : null,
+              h('span', { className: 'mc-spacer' }),
+              item.editable === true
+                ? (editing
+                  ? h(React.Fragment, null,
+                    h('button', { className: 'mc-btn', 'data-primary': 'true', onClick: function () { void savePendingAdd(item.queueIndex, pendingDraft) }, disabled: busy }, '保存'),
+                    h('button', { className: 'mc-btn', onClick: function () { setPendingEdit(null) }, disabled: busy }, '取消'),
+                  )
+                  : h('button', {
+                    className: 'mc-btn', disabled: busy,
+                    onClick: function () {
+                      setPendingEdit(key)
+                      setPendingDraft(body)
+                      setPendingReasoning(reasoning)
+                      setPendingToolName(toolName)
+                      setPendingToolInput(toolInput)
+                    },
+                  }, '编辑'))
+                : h('span', { className: 'mc-meta' }, '内容来自条目文件，去「手动上下文」页改'),
+              h('button', {
+                className: 'mc-btn', disabled: busy,
+                title: item.source === 'manual-context'
+                  ? '取消这次手动上下文同步（这次排队的所有待注入段会一起取消）'
+                  : '丢掉这条排队中的改动（还没写进日志，丢掉不留痕迹）',
+                onClick: function () { void dropPendingAdd(item.queueIndex) },
+              }, item.source === 'manual-context' ? '取消同步' : '丢弃'),
+            ),
+            editing
+              ? h(React.Fragment, null,
+                // 思维链 / 工具调用只属于模型输出（含工具调用消息）；
+                // 用户输入、工具返回是单块消息，没有思维链这回事。
+                item.kind === 'assistant' || item.kind === 'tool-call'
+                  ? h(React.Fragment, null,
+                    h('div', { className: 'mc-reason-head' }, '思维链（reasoning 块，可留空）'),
+                    h('textarea', {
+                      className: 'mc-pending-ta mc-reason-ta',
+                      value: pendingReasoning,
+                      disabled: busy,
+                      placeholder: '留空就不产生思维链块',
+                      onChange: function (event) { setPendingReasoning(event.target.value) },
+                    }),
+                  )
+                  : null,
+                h('div', { className: 'mc-reason-head' }, '正文'),
+                h('textarea', {
+                  className: 'mc-pending-ta',
+                  value: pendingDraft,
+                  disabled: busy,
+                  onChange: function (event) { setPendingDraft(event.target.value) },
+                }),
+                item.kind === 'assistant' || item.kind === 'tool-call'
+                  ? h('div', { className: 'mc-row', style: { gap: '6px' } },
+                  h('input', {
+                    className: 'mc-input', style: { flex: '1' },
+                    placeholder: '工具名（可留空；填了会和思维链、正文合并成同一条模型输出）',
+                    value: pendingToolName,
+                    disabled: busy,
+                    onChange: function (event) { setPendingToolName(event.target.value) },
+                  }),
+                  h('input', {
+                    className: 'mc-input', style: { flex: '1' },
+                    placeholder: '工具参数（JSON，可留空）',
+                    value: pendingToolInput,
+                    disabled: busy,
+                    onChange: function (event) { setPendingToolInput(event.target.value) },
+                  }),
+                )
+                  : null,
+                h('div', { className: 'mc-note' },
+                  item.kind === 'assistant' || item.kind === 'tool-call'
+                    ? '思维链 / 正文 / 工具调用会合并进同一条模型输出消息，和历史里的形状一致。'
+                    : '用户输入 / 工具返回本身就是单块消息，只有正文。'),
+              )
+              : h(React.Fragment, null,
+                reasoning !== ''
+                  ? h('div', { className: 'mc-reason' },
+                    h('div', { className: 'mc-reason-head' }, '思维链（reasoning 块）'),
+                    h('pre', { className: 'mc-reason-body' }, reasoning))
+                  : null,
+                h('div', { className: 'mc-pending-text' }, body !== '' ? body : '（空）'),
+                toolName !== ''
+                  ? h('div', { className: 'mc-note' }, '工具调用：' + toolName + (toolInput !== '' ? ' · ' + toolInput : ''))
+                  : null,
+              ),
+          ))
+        }
+        return rows
+      })()
+
       const messageDetail = function (message) {
         const parts = Array.isArray(message.parts) ? message.parts : []
         const focus = focusPart === null ? null : partOf(message, focusPart)
@@ -1638,6 +1872,9 @@ window.__ModuleLoader__.load({
               + (isPart ? ' · 片段 ' + String(focus.index + 1) + '/' + String(parts.length) : '')),
             message.protected ? h('span', { className: 'mc-meta' }, '· 系统头，每轮由 Harness 重渲染') : null,
             message.edited ? h('span', { className: 'mc-badge' }, '已编辑') : null,
+            message.pendingDelete === true
+              ? h('span', { className: 'mc-badge', 'data-pending': 'delete', title: '已排上删除，下一次对话开始时生效' }, '将被删除')
+              : null,
             h('span', { className: 'mc-spacer' }),
             isEditing
               ? h(React.Fragment, null,
@@ -1761,7 +1998,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mc-scroll' },
           history === null
             ? h('div', { className: 'mc-empty' }, busy ? '读取中…' : '还没有数据')
-            : (history.messages || []).map(function (message) {
+            : [].concat((history.messages || []).map(function (message) {
               const badge = badgeOf(message)
               const parts = Array.isArray(message.parts) ? message.parts : []
               const draggable = !message.protected
@@ -1809,6 +2046,9 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'mc-kind', 'data-k': badge.kind }, badge.label),
                   h('span', { className: 'mc-meta' }, '#' + String(message.seq) + (parts.length > 1 ? ' · ' + String(parts.length) + ' 片段' : '')),
                   message.edited ? h('span', { className: 'mc-badge' }, '已编辑') : null,
+                  message.pendingDelete === true
+                    ? h('span', { className: 'mc-badge', 'data-pending': 'delete', title: '已排上删除，下一次对话开始时生效' }, '将被删除')
+                    : null,
                   h('span', { className: 'mc-spacer' }),
                   h('button', {
                     className: 'mc-x mc-x-sm', title: '从模型可见上下文中删除这条消息',
@@ -1842,7 +2082,7 @@ window.__ModuleLoader__.load({
                   }))
                   : null,
               )
-            }),
+            }), pendingRows),
           ),
         ),
         h('div', { className: 'mc-main' },

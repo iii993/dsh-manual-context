@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { homedir } from 'node:os'
 /**
  * 把插件重新挂载进 dsh profile 的 node_modules。
  *
@@ -24,7 +25,7 @@ const argOf = (name, fallback) => {
 }
 
 const source = resolve(argOf('--source', process.cwd()))
-const dshHome = argOf('--dsh-home', process.env.DSH_HOME || 'H:\\dsh-home')
+const dshHome = argOf('--dsh-home', process.env.DSH_HOME || join(homedir(), '.dsh'))
 const profile = resolve(argOf('--profile', join(dshHome, 'profiles', 'web')))
 const dryRun = args.includes('--dry-run')
 

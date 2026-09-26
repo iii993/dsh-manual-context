@@ -12,8 +12,8 @@
  */
 import { ensureRoots, listEntries, listRoots, readEntry, writeEntry, writeEntryMeta, createEntry, deleteEntry, contextRoots, dshHome, segmentsToBody, readSettings, writeSettings, injectionEnabled } from './store.js'
 import { repairSessions, zstdAvailable } from './repair.js'
-import { listHistoryMessages, applyEdit, forgetEdit, clearEdits, loadEdits, appendMessage, deleteMessages, deletePart, reorderMessages, enqueueOperation, listQueuedSessions, loadQueue, saveQueue, openCoordinates, sessionEvents } from './history.js'
-import { historyIndex, isPresent, syncManualContext } from './inject.js'
+import { listHistoryMessages, applyEdit, forgetEdit, clearEdits, loadEdits, appendMessage, deleteMessages, deletePart, reorderMessages, enqueueOperation, listQueuedSessions, loadQueue, saveQueue, openCoordinates, sessionEvents, appendApplyLog } from './history.js'
+import { historyIndex, isPresent, syncManualContext, planTargets, manualContextNodes } from './inject.js'
 
 export const HTTP_PATH = '/manual-context'
 const BODY_LIMIT = 4 * 1024 * 1024
@@ -33,7 +33,7 @@ export function createHandler(ctx) {
     try {
       if (request.method === 'GET') {
         const url = new URL(request.url ?? HTTP_PATH, 'http://dsh.local')
-        json(response, 200, handleGet(ctx, url))
+        json(response, 200, await handleGet(ctx, url))
         return
       }
       if (request.method === 'POST') {
@@ -45,7 +45,7 @@ export function createHandler(ctx) {
           json(response, 400, { ok: false, error: '请求体不是合法 JSON' })
           return
         }
-        json(response, 200, handlePost(ctx, payload))
+        json(response, 200, await handlePost(ctx, payload))
         return
       }
       json(response, 405, { ok: false, error: '不支持的请求方法' })
@@ -79,7 +79,7 @@ function cwdOf(ctx, sessionId) {
   return session?.header?.cwd
 }
 
-function handleGet(ctx, url) {
+async function handleGet(ctx, url) {
   const op = url.searchParams.get('op') ?? 'status'
   const sessionId = url.searchParams.get('sessionId') ?? undefined
   const cwd = sessionId === undefined ? undefined : cwdOf(ctx, sessionId)
@@ -124,7 +124,14 @@ function handleGet(ctx, url) {
     }
     case 'history': {
       if (sessionId === undefined || sessionId === '') throw new Error('缺少 sessionId')
-      return { ok: true, ...listHistoryMessages(ctx, sessionId), cwd: cwd ?? null }
+      // 顺带把「排队中、还没机会写进去」的东西也列出来 —— 否则它们在面板上完全隐形，
+      // 用户既看不到自己排上的改动，也没法改。
+      return {
+        ok: true,
+        ...listHistoryMessages(ctx, sessionId),
+        pendingAdds: listPendingAdds(ctx, sessionId, cwd),
+        cwd: cwd ?? null,
+      }
     }
     case 'export-session': {
       if (sessionId === undefined || sessionId === '') throw new Error('缺少 sessionId')
@@ -247,6 +254,7 @@ export function runOperation(ctx, payload) {
       const result = appendMessage(ctx, sessionId, {
         kind: payload.kind,
         text: payload.text,
+        blocks: Array.isArray(payload.blocks) ? payload.blocks : undefined,
         toolName: payload.toolName,
         toolInput: payload.toolInput,
         callId: payload.callId,
@@ -274,6 +282,58 @@ export function runOperation(ctx, payload) {
       }
       return { ok: true, ...result }
     }
+    case 'drop-pending': {
+      // 丢弃一条「排着队、还没写进去」的改动（目前只用于面板追加的消息）。
+      if (sessionId === undefined || sessionId === '') throw new Error('缺少 sessionId')
+      const queueIndex = payload.queueIndex
+      if (!Number.isSafeInteger(queueIndex)) throw new Error('缺少 queueIndex')
+      const queued = loadQueue(sessionId)
+      if (queueIndex < 0 || queueIndex >= queued.length) throw new Error('这条排队改动已经不存在了（可能刚被应用）')
+      const droppedOperation = queued[queueIndex]
+      queued.splice(queueIndex, 1)
+      saveQueue(sessionId, queued)
+      return { ok: true, dropped: 1, op: droppedOperation?.op ?? null, remaining: queued.length }
+    }
+    case 'edit-pending': {
+      // 改写一条「排着队、还没写进去」的消息正文 —— 这正是「将要添加的内容改不了」的补丁。
+      if (sessionId === undefined || sessionId === '') throw new Error('缺少 sessionId')
+      const queueIndex = payload.queueIndex
+      if (!Number.isSafeInteger(queueIndex)) throw new Error('缺少 queueIndex')
+      const queued = loadQueue(sessionId)
+      const target = queued[queueIndex]
+      if (target === undefined) throw new Error('这条排队改动已经不存在了（可能刚被应用）')
+      if (target.op !== 'append-message') {
+        throw new Error('手动上下文的正文来自条目文件，请到「手动上下文」页改条目本身')
+      }
+      const text = typeof payload.text === 'string' ? payload.text : ''
+      // 思维链与工具调用只属于模型输出（含工具调用消息）；用户输入、工具返回是单块消息，
+      // 即使前端多传了这些字段也一律忽略 —— 免得造出「用户消息带思维链」这种怪东西。
+      const carriedKind = typeof target.payload?.kind === 'string' ? target.payload.kind : 'user'
+      const canReason = carriedKind === 'assistant' || carriedKind === 'tool-call'
+      const reasoning = canReason && typeof payload.reasoning === 'string' ? payload.reasoning : ''
+      const toolName = canReason && typeof payload.toolName === 'string' ? payload.toolName : ''
+      const toolInput = canReason && typeof payload.toolInput === 'string' ? payload.toolInput : ''
+      // 思维链 / 模型输出 / 工具调用本来就是同一条 assistant 消息里的三个内容块，
+      // 这里按这个形状组装 —— appendMessage 会把它们写成一整条消息（相邻的自动合并）。
+      const blocks = []
+      if (reasoning.trim() !== '') blocks.push({ type: 'reasoning', text: reasoning })
+      if (text.trim() !== '') blocks.push({ type: 'text', text: text })
+      if (toolName.trim() !== '') blocks.push({ type: 'tool-call', name: toolName, args: toolInput })
+      const kind = blocks.some(function (block) { return block.type !== 'text' })
+        ? 'assistant'
+        : (typeof target.payload?.kind === 'string' ? target.payload.kind : 'user')
+      queued[queueIndex] = Object.assign({}, target, {
+        payload: Object.assign({}, target.payload, {
+          kind,
+          text,
+          blocks: blocks.length > 0 ? blocks : undefined,
+          toolName: toolName !== '' ? toolName : undefined,
+          toolInput: toolInput !== '' ? toolInput : undefined,
+        }),
+      })
+      saveQueue(sessionId, queued)
+      return { ok: true, updated: 1, queueIndex, kind, blockCount: blocks.length }
+    }
     case 'set-inject': {
       // 注入总开关。关掉之后不写入新内容，并且把已经注入的节点遮蔽掉 ——
       // 关掉时顺手同步一次，面板不用再点一次「同步到会话」。
@@ -288,12 +348,7 @@ export function runOperation(ctx, payload) {
       }
       return { ok: true, ...saved, sync }
     }
-    case 'repair-sessions': {
-      // 一键修复：扫描所有会话，把旧版插件写坏的「非法遮蔽事件」修好（带备份）。
-      const running = new Set()
-      for (const agent of agentList(ctx)) if (typeof agent?.id === 'string') running.add(agent.id)
-      return { ok: true, ...repairSessions({ apply: payload.apply !== false, running }) }
-    }
+    // repair-sessions 需要等 dsh 自己的加载校验（异步），放在 handlePost 里单独处理。
     case 'repair-capability':
       return { ok: true, supported: zstdAvailable() }
     case 'import-session': {
@@ -308,7 +363,16 @@ export function runOperation(ctx, payload) {
 }
 
 /** HTTP POST 入口：空闲时的写操作改为排队，并如实告诉面板。 */
-function handlePost(ctx, payload) {
+async function handlePost(ctx, payload) {
+  // 修复会话日志：内部要用 dsh 自己的加载路径重新校验，所以是异步的。
+  // 带 sessionId 时只处理那一个会话 —— 面板的「修复此对话」走的就是这条路，
+  // 不必每次都把上百个会话全扫一遍。
+  if (payload?.op === 'repair-sessions') {
+    const running = new Set()
+    for (const agent of agentList(ctx)) if (typeof agent?.id === 'string') running.add(agent.id)
+    const target = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
+    return { ok: true, ...(await repairSessions({ apply: payload.apply !== false, running, sessionId: target })) }
+  }
   try {
     return runOperation(ctx, payload)
   } catch (error) {
@@ -322,6 +386,72 @@ function handlePost(ctx, payload) {
 }
 
 /**
+ * 排队中「将要添加」的条目。
+ *
+ * 两类来源：
+ *   1. `append-message`：面板上手动追加的消息（正文就在队列里，可以直接改）；
+ *   2. `sync-context`：还没注入进去的手动上下文段（正文在条目文件里，改要去条目页）。
+ *
+ * queueIndex 是队列数组下标 —— 编辑 / 丢弃都靠它定位。
+ */
+function listPendingAdds(ctx, sessionId, cwd) {
+  const queued = loadQueue(sessionId)
+  const out = []
+  for (let queueIndex = 0; queueIndex < queued.length; queueIndex += 1) {
+    const operation = queued[queueIndex]
+    if (operation?.op === 'append-message') {
+      const queuedPayload = operation.payload ?? {}
+      const carried = Array.isArray(queuedPayload.blocks) ? queuedPayload.blocks : []
+      const pick = function (type) {
+        return carried.find(function (block) { return block !== null && typeof block === 'object' && block.type === type }) ?? null
+      }
+      const reasoningBlock = pick('reasoning')
+      const textBlock = pick('text')
+      const callBlock = pick('tool-call')
+      out.push({
+        queueIndex,
+        source: 'append',
+        kind: typeof queuedPayload.kind === 'string' ? queuedPayload.kind : 'user',
+        // blocks 是权威；没有 blocks 时回落到单段 text（兼容更早排上的队列）
+        text: textBlock !== null
+          ? String(textBlock.text ?? '')
+          : (typeof queuedPayload.text === 'string' ? queuedPayload.text : ''),
+        reasoning: reasoningBlock === null ? '' : String(reasoningBlock.text ?? ''),
+        toolName: callBlock !== null
+          ? String(callBlock.name ?? '')
+          : (typeof queuedPayload.toolName === 'string' ? queuedPayload.toolName : ''),
+        toolInput: callBlock !== null
+          ? String(callBlock.arguments ?? callBlock.args ?? '')
+          : (typeof queuedPayload.toolInput === 'string' ? queuedPayload.toolInput : ''),
+        editable: true,
+      })
+      continue
+    }
+    if (operation?.op !== 'sync-context') continue
+    if (typeof cwd !== 'string' || cwd === '') continue
+    const session = ctx.sessions?.get?.(sessionId)
+    if (session === undefined) continue
+    const present = manualContextNodes(session)
+    for (const target of planTargets(cwd)) {
+      if (present.has(target.id)) continue
+      const text = typeof target.text === 'string' && target.text !== ''
+        ? target.text
+        : (Array.isArray(target.blocks) ? target.blocks.map(function (block) { return String(block?.text ?? '') }).join('') : '')
+      out.push({
+        queueIndex,
+        source: 'manual-context',
+        kind: target.role === 'assistant' ? 'assistant' : (target.role === 'tool-result' ? 'tool-result' : 'user'),
+        text,
+        entryId: target.entryId ?? null,
+        entryName: target.name ?? null,
+        editable: false,
+      })
+    }
+  }
+  return out
+}
+
+/**
  * 应用排队中的操作（由 agent/request 钩子调用：此时 step/start 已写入，坐标合法）。
  *
  * 只处理当前确实开着 step 的会话；仍无法写入的操作留在队列里，
@@ -331,21 +461,34 @@ export function applyQueuedOperations(ctx) {
   const applied = []
   for (const sessionId of listQueuedSessions()) {
     const session = ctx.sessions?.get?.(sessionId)
-    if (session === undefined) continue
+    if (session === undefined) {
+      appendApplyLog(sessionId, '跳过：会话不在内存里')
+      continue
+    }
     const open = openCoordinates(session)
-    if (open.turn === null || open.step === null) continue
+    if (open.turn === null || open.step === null) {
+      appendApplyLog(sessionId, '跳过：还没有开放的 turn/step')
+      continue
+    }
     const remaining = []
     for (const operation of loadQueue(sessionId)) {
+      const op = typeof operation?.op === 'string' ? operation.op : ''
       try {
         // 队列里的 op / sessionId 才是权威：注入类操作排队时只带了 payload 正文。
-        runOperation(ctx, Object.assign({}, operation.payload, { op: operation.op, sessionId }))
+        const result = runOperation(ctx, Object.assign({}, operation.payload, { op, sessionId }))
+        appendApplyLog(sessionId, '完成 ' + op + ' -> ' + JSON.stringify(result ?? null))
         applied.push(sessionId)
       } catch (error) {
-        if (error !== null && typeof error === 'object' && error.code === 'session-write-pending') {
-          remaining.push(operation)
-          continue
+        const message = error instanceof Error ? error.message : String(error)
+        // 写不进去的操作**一律留在队列里**。以前这里会把非 pending 的错误直接丢掉，
+        // 用户看到的就是「排队中」消失、对话里却什么都没注入，且无迹可查。
+        const attempts = (Number.isSafeInteger(operation?.attempts) ? operation.attempts : 0) + 1
+        if (attempts > 5) {
+          appendApplyLog(sessionId, '放弃 ' + op + '（已试 ' + String(attempts) + ' 次）：' + message)
+        } else {
+          remaining.push(Object.assign({}, operation, { attempts }))
+          appendApplyLog(sessionId, '重试 ' + op + '（第 ' + String(attempts) + ' 次）：' + message)
         }
-        ctx.logger?.warn?.('[manual-context] 排队操作应用失败: ' + (error instanceof Error ? error.message : String(error)))
       }
     }
     saveQueue(sessionId, remaining)

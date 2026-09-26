@@ -193,16 +193,14 @@ user      │ 看看配置                                    ← 本轮真实�
 - 位置：`weight <= 0` 的条目排在系统提示词正下方，`weight > 0` 的排在对话末尾（权重降序）。
   需要插到系统提示词下方、而对话又已经很长时，会走一次「遮蔽 + 重放」式重排（超过 300 条会放弃并记录警告）。
 - 面板上的 **「同步到会话」** 按钮可以立即触发一次同步；写不进去的部分会自动排队，下一轮请求自动应用。
-- **什么时候能立即注入**（实测结论，2026-09 校准）：
+- **会话空闲时（上一次对话已结束，或新建还没说话）一律只排队，不直接写日志。**
+  真正的写入还是发生在 `agent/request` —— 那时 turn 和 step 都开着，写什么形状都合法。
+  点「同步到会话」时若会话正空闲，面板会提示「已排队，下一次对话开始时自动注入」。
 
-  | 会话格式 | 空闲时（上一次对话已结束 / 新建还没说话） | 依据 |
-  | --- | --- | --- |
-  | **v4**（dsh 0.1.7 起新建的会话） | **可以直接写入**，模型输出 / 思维链 / 工具调用都能写 | v4 的加载校验（迁移 + surface 折叠 + 存储校验）**不检查** turn 关系；实测 turn 外的 `user/message`、多块 `assistant/message`、遮蔽节点、`tool/result` 全部通过 |
-  | **v0–v3**（升级前的老会话） | 只有 `user/message` 能立即写，其余排队等下一轮 | v3→v4 迁移器要求 `system/message`、`assistant/message`、`tool/call` 匹配**开放 turn + step**，写进去会让会话打不开 |
-
-  空闲时写的 `assistant/message` 用**日志里最后一次出现的 turn/step** 当坐标（v4 不校验，只影响面板上的步骤归属）。
-- **新建对话、还没发第一句话时就能注入**：系统提示词走 `request/header` 事件、**不是** surface 节点，
-  所以注入的上下文天然占据 surface 最前面 —— 也就是排在你的第一句话之前。
+  > 早期版本趁空闲直接写，代价是**对话重开时一片空白**：v4 的加载校验要求 surface 的第一个
+  > 节点是 `system/message`，而空闲写进去的手动上下文节点是 `user/message`，系统提示词随后
+  > 一写进来，整份日志就再也通不过校验；空闲时写的遮蔽事件也落在 turn 之外，同样非法。
+  > 详见下面的「为什么会一片空白」。
 
 ### 注入总开关
 
@@ -504,30 +502,70 @@ New-Item -ItemType Junction \
 | POST | `{op:'append-message', kind, text, toolName?, toolInput?, callId?, isError?}` | 追加新消息（`kind`: user / assistant / tool-call / tool-result） |
 | POST | `{op:'import-session', messages:[…]}` | 从导出的 JSON 导入对话，按 `message.id` 去重后**追加**到当前会话末尾 |
 | POST | `{op:'sync-context'}` | 立即把手动上下文条目同步进会话（空闲时排队，下一轮请求自动应用） |
+| POST | `{op:'edit-pending', queueIndex, text}` | 改写一条**排队中、还没写进日志**的追加消息（只能改面板里手动追加的；手动上下文的正文请去条目页改） |
+| POST | `{op:'drop-pending', queueIndex}` | 丢弃一条排队中的改动（还没落盘，丢掉不留痕迹） |
 | POST | `{op:'save-segments', id, meta?, segments:[{meta,text},…]}` | 片段级保存：宿主用 `segmentsToBody` 把片段数组重组成正文写盘 |
 
 ## 排查
 
-### 一键修复打不开的对话
+### 排队中的改动在面板上可见
 
-面板上的「修复对话」按钮会扫描 `$DSH_HOME/sessions/**/*.jsonl.zstd`，把插件旧版写坏的**非法遮蔽事件**修好，并报告扫描 / 修复 / 跳过的数量。
+会话空闲时做的编辑 / 追加 / 注入不会立刻写日志（写进去会让对话下次打不开），而是**排队**等下一轮 `agent/request` 应用。排队期间面板会这样呈现：
 
-判据很窄：`system/message` 事件的来源是 `plugin:@dsh-external/manual-context`（旧版用它做遮蔽节点，见下面「为什么会一片空白」）。修复只改这一个字段为 `system-prompt` —— 内容仍为空、位置与遮蔽关系完全不变，模型看到的内容不会有任何变化。原文件先备份成 `*.corrupt-bak`，正在运行的会话会跳过（免得和 dsh 内存里的日志打架）。
+- 已经排上删除的消息 → 列表和详情里带 **「将被删除」** 标签；
+- 还没写进去的追加 → 列表底部单独一块 **「将被添加」**，正文直接显示出来；
+  - 面板里手动追加的消息可以**就地改写**（编辑）/ **丢弃**；
+  - 手动上下文段的内容来自条目文件，这里只提示去「手动上下文」页改。
 
-命令行等价物：[tools/fix-mask-events.mjs](tools/fix-mask-events.mjs)（先跑 dsh 真实加载校验确认失败，再动手）。
+以前这些排队内容在面板上完全隐形：既不知道排了什么，也改不了 —— 尤其「将要添加进对话的消息」根本无从下手。
+
+### 修复打不开的对话
+
+面板工具栏上有两个按钮：
+
+- **「修复此对话」**：只处理会话下拉里当前选中的那一个 —— 日志是逐个坏的，没必要每次都全扫一遍。
+- **「修复全部」**：扫描 `$DSH_HOME/sessions/**/*.jsonl.zstd` 下的所有对话，批量处理。
+
+修复器认得三类坏法，全都源自「会话还在空闲时就把节点写进了 surface」：
+
+| 坏法 | 加载时的报错 | 修法 |
+| --- | --- | --- |
+| 注入节点压在系统提示词前面 | `system/message requires a protected first surface head` | 让这些**已经被遮蔽掉**的注入节点整体退出 surface 折叠（改写成带 `ignorable` 的未知事件），并把因此「失去遮蔽对象」的空 `system/message` 改成 `append` |
+| 注入的助手 / 工具段落在 turn 之外 | `assistant/message does not match an open turn and step` | 降级成 `user/message`（唯一不要求 open turn/step 的 surface 类型），内容与 id 原样保留 |
+| 遮蔽事件的来源是插件自己 | `message must have system-prompt source` | 只把 `source.kind` 改成 `system-prompt` |
+
+两条安全绳：
+
+1. **每一步改完都用 dsh 自己的加载路径重新校验**（`createSessionFormatCatalogWithChildren(…).createRestore(header, { validation: 'current' })`），通不过就整份放弃、绝不落盘；拿不到 dsh 的格式包时只报告、不写盘。
+2. 原文件先备份成 `*.corrupt-bak`，正在运行的会话会跳过（免得和 dsh 内存里的日志打架）。
+
+修完要**重启 dsh** 才会重新读盘。还有一类坏法（`tool/result` 找不到配对的 tool/call，报 `not-started error requires an object`）需要另一种修法，修复器会如实报告「暂不支持」，不会硬改。
+
+命令行等价物：[tools/fix-mask-events.mjs](tools/fix-mask-events.mjs)（只覆盖第一类判据的离线扫描）。
 
 ### 为什么会一片空白
 
 对话点开后**一片空白、而且前后端都不报错**，通常是会话**加载**就失败了：
 
 ```
-stored session "…" failed validation:
-Error: session event at seq N message must have system-prompt source
+stored session "…" is corrupt: SessionFormatError:
+  system/message requires a protected first surface head
 ```
 
-插件删除 / 重排节点时会写一条空 `system/message` 把原节点遮蔽掉。这一步必须用 `system/message`（只有它能带 `sourceEventSeqs` 这个遮蔽标记，换成 `assistant/message` 会被拒绝：`assistant/message embeds its source stream and cannot carry sourceEventSeqs`），但**来源必须是 `system-prompt`**。旧版把来源写成了插件自己，于是整份日志校验失败 —— 一条不合格就让整个会话打不开。
+**根因**：v4 在加载时折叠 surface 并检查三条硬规则 ——
 
-新版本已经改成 `source: { kind: 'system-prompt' }`；同时排序不再搬动系统提示词节点（重放会改写它的来源，等于再写坏一次），若某次排序必须移动系统提示词就直接放弃。
+1. surface 的**第一个节点必须是 `system/message`**（`protectedHead`）；
+2. `system/message`、`developer/message`、`assistant/message`、`tool/call` 以及**追加形式**的
+   `tool/result` 必须落在**打开的 turn + step** 里（替换形式的 `tool/result` 只要求打开的 turn）；
+3. 遮蔽事件的来源必须是 `system-prompt`（只有 `system/message` 能带 `sourceEventSeqs` 这个
+   遮蔽标记，换成 `assistant/message` 会被拒）。
+
+插件早期版本在**会话还空着**的时候就往里写手动上下文节点：`user/message` 于是成了 surface 的
+第一个节点（违反 1），助手 / 工具段落在 turn 之外（违反 2），遮蔽事件来源写成了插件自己（违反 3）。
+运行时完全看不出来，**下一次加载就整份日志被拒** —— 一条不合格就让整个对话打不开。
+
+写入侧现在改成「空闲只排队」（见「注入时机与去重」），排序也不再搬动系统提示词节点；
+已经坏掉的日志用「修复此对话 / 修复全部」修回来（见上）。
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -538,9 +576,9 @@ Error: session event at seq N message must have system-prompt source
 | 编辑历史时提示「已被压缩」 | 目标节点已不在当前 surface 上 | 属预期：被压缩掉的消息无法再被替换 |
 | 编辑模型输出时提示「需要重放整段历史」 | `assistant/message` 做不了 surface 替换，只能遮蔽 + 重放，而这一段超过 300 条 | 改更靠后的消息，或先删掉它再在末尾追加 |
 | **重启后某个会话打不开**：`… message must have role "user"` | 旧版插件用 `user/message` 承载了 `role:'assistant'` 的消息（运行时看不出问题） | 已修复写入路径；坏掉的会话用 `node tools/repair-migration.mjs --apply` 原地修回来 |
-| **升级到 dsh 0.1.7 后某个会话打不开**：`Session migration from v3 to v4 refuses the transformed artifact: system/message does not match an open turn and step` | 旧版插件在 `turn/end` 之后（面板空闲编辑）写入了借用旧坐标的表面事件，v3 不校验、v4 迁移直接拒绝 | 用 `node tools/repair-migration.mjs --apply` 修回；写入侧现在**按会话版本区分**：v4 空闲也允许写（实测安全），v0–v3 仍排队到 `agent/request` 窗口 |
+| **重启后某个会话打不开**：`system/message requires a protected first surface head` / `assistant/message does not match an open turn and step` | 旧版插件在会话空闲时把手动上下文节点写进了 surface（首节点不是 system/message，或助手 / 工具段落在 turn 之外） | 点「修复此对话」（或「修复全部」）；写入侧现在空闲只排队，不会再产生这类日志 |
 | **升级 dsh / 用插件管理器装过别的插件后，面板入口整条消失**，日志里没有插件的 `已加载` 行 | 本插件是**手工 junction** 挂在 profile 的 `node_modules/@dsh-external/manual-context`；profile 用 pnpm（`nodeLinker: hoisted`），`pnpm install` 会 prune 掉不在 lockfile 里的顶层包，junction 就这样被清掉了（`cordis.patch.yml` 里的 insert 行还在） | 跑 `node tools/relink.mjs` 重建挂载，然后**重启 dsh** |
-| 面板顶部出现「⏳ 排队中：N 项改动等下一次对话开始时自动应用」 | 会话是 **v4 之前**的旧格式，且现在没有开放的 turn/step | 预期行为：下一次给模型发消息时自动应用。**v4 会话（dsh 0.1.7 起新建的）不再排队，空闲也能直接注入** |
+| 面板顶部出现「⏳ 排队中：N 项改动等下一次对话开始时自动应用」 | 会话当前没有开放的 turn/step（上一次对话已结束，或新建还没说话） | 预期行为：空闲写入会让对话下次打不开，所以一律排队，下一次给模型发消息时自动应用 |
 | 编辑/拖动时提示「含工具调用（tool-call）…已拒绝」 | 会话是 **v4 之前**的旧格式：重放会缺配套的 tool/call，写出来就是打不开的日志 | 预期行为：改用「删除」，或先把该会话用一次（打开并对话）让它升级成 v4 —— v4 会话可以正常编辑/重排工具轨迹 |
 
 > **注意**：dsh 0.1.6 注册 HTTP 路由的服务名是 `ctx.webServer`（`@deepseek-ai/dsh-host-webserver`）。

@@ -1,3 +1,4 @@
+import { homedir } from 'node:os'
 /**
  * 诊断：手动上下文注入的节点在「重新加载会话」之后是否还在表面（surface）上。
  * 折叠规则与 dsh 一致：surfaceOp:'append' 追加，{op:'replace',startSeq,endSeq} 原地替换。
@@ -6,7 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const root = process.argv[2] ?? 'H:/dsh-home/sessions'
+const root = process.argv[2] ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'sessions')
 const limit = Number(process.argv[3] ?? 6)
 
 function readLines(file) {

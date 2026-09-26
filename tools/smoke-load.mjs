@@ -1,7 +1,9 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 
-const require = createRequire('H:/dsh-home/profiles/web/package.json')
+const require = createRequire(join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'profiles/web/package.json'))
 const { Context } = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis')).href)
 const pluginMod = await import(pathToFileURL(require.resolve('@dsh-external/manual-context')).href)
 const plugin = pluginMod.default ?? pluginMod

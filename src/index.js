@@ -13,7 +13,11 @@ import { installHttp, applyQueuedOperations } from './http.js'
 import { ensureRoots, dshHome, FOLDER_NAME } from './store.js'
 
 export const name = 'manual-context'
-export const inject = ['sessions']
+// agents 必须在这里声明：排队操作是在 agent/request 钩子里用**插件根 ctx** 重放的，
+// 而 appendMessage 会读 ctx.agents 取模型身份。少声明一个，
+// 空闲排队就永远重放失败（cannot get property "agents" without inject），
+// 表现就是「排队中一直显示、对话里却永远注入不进去」。
+export const inject = ['sessions', 'agents']
 
 /** 挂载注入钩子与 HTTP 接口。 */
 export function apply(ctx) {

@@ -275,6 +275,10 @@ export function syncManualContext(ctx, sessionId) {
   if (session === undefined) throw new Error('会话当前不在运行中: ' + sessionId)
   const cwd = session?.header?.cwd
 
+  // 写入时机不在这里判断 —— 和历史编辑一样：空闲时 appendMessage/deleteMessages
+  // 自己会抛 SessionWritePendingError，下面逐条容错把它们记进 deferred，
+  // HTTP 层据此排队，等下一轮 agent/request（step 已打开）再应用。
+
   // 总开关关掉：不再注入，并且把已经注入的节点全部遮蔽掉 ——
   // 否则「关了开关」只是不再新增，旧内容还留在模型的上下文里。
   if (!injectionEnabled()) {

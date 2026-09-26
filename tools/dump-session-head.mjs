@@ -1,3 +1,4 @@
+import { homedir } from 'node:os'
 /**
  * 排查用：按修改时间倒序列出会话，打印每个会话的 surface 节点（含事件来源与遮蔽关系）。
  * 用来确认「对话打不开」「注入位置不对」这类问题。
@@ -8,7 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const root = process.argv[2] ?? 'H:/dsh-home/sessions'
+const root = process.argv[2] ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'sessions')
 const limit = Number(process.argv[3] ?? 3)
 
 function readLines(file) {
