@@ -817,12 +817,26 @@ function writePosition(session, options) {
  * 曾经这里对 v4 做过「坐标回退到日志里最后一次出现的 turn/step」的放行，
  * 那是错的：v4 一样会校验 turn 关系，放行只会写出打不开的日志。
  */
+/** surface 的首节点是否已经是系统提示词（v4 的 protectedHead）。 */
+export function hasProtectedHead(session) {
+  const nodes = [...session.surface.nodes]
+  if (nodes.length === 0) return false
+  const head = sessionEvents(session)[nodes[0]]
+  return head !== undefined && head.type === 'system/message'
+}
+
 function writablePosition(session) {
-  // 注意：user/message 在 v4 里确实不要求 turn/step 关系，空闲时也写得进去 ——
-  // 但它会成为 surface 的第一个节点，等系统提示词随后写进来，整份日志就通不过
-  // 「system/message requires a protected first surface head」。所以这里**所有**类型
-  // 一视同仁：没有开放的 turn/step 就抛 SessionWritePendingError，交给上层排队。
+  // 两道门槛，缺一不可：
+  //   1) turn/step 必须开着（否则事件落在 turn 之外）；
+  //   2) surface 首节点必须已经是系统提示词 —— agent/request 发生在 step/start 之后、
+  //      系统提示词落 surface **之前**，这时写进去的 user/message 会成为首节点，
+  //      等系统提示词一写进来，整份日志就通不过 protectedHead 校验，会话下次打不开
+  //      （2026-09 的事故：导入写坏 session-b526d0d4 就是这么来的）。
+  // 两道都不过就一律抛 SessionWritePendingError，交给上层排队等下一轮。
   const open = writePosition(session)
+  if (!hasProtectedHead(session)) {
+    throw new SessionWritePendingError('系统提示词还没写进这段会话：现在写入会抢在它前面，改动已排队。')
+  }
   return { turn: open.turn, step: open.step }
 }
 

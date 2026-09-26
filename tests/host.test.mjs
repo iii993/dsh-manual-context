@@ -532,15 +532,18 @@ function appendHarness() {
   const appended = []
   // snapshotEvents 是按顺序展开的数组，内部的 seq 必须和下标对齐 ——
   // 否则「找未配对的工具调用」这类按 seq 索引的逻辑在测试里永远读不到新事件。
+  // 首节点必须是系统提示词 —— 真 dsh 的每个会话都这样（v4 的 protectedHead）。
+  // 替身不建模它，「写入时机」这类问题在测试里就结构性地看不见。
   const base = [
-    { type: 'turn/start', seq: 0, time: 1, data: { turn: 3 } },
-    { type: 'step/start', seq: 1, time: 2, data: { turn: 3, step: 2 } },
+    { type: 'system/message', seq: 0, time: 1, data: { turn: 3, step: 2, message: { id: 'sys-append', role: 'system', content: [{ type: 'text', text: 'sys' }], source: { kind: 'system-prompt' } } } },
+    { type: 'turn/start', seq: 1, time: 2, data: { turn: 3 } },
+    { type: 'step/start', seq: 2, time: 3, data: { turn: 3, step: 2 } },
   ]
   const session = {
     id: 'session-append',
     get seq() { return base.length + appended.length },
     header: { cwd: join(sandbox, 'ws-append') },
-    surface: { nodes: [0, 1] },
+    surface: { nodes: [0] },
     snapshotEvents: () => [...base, ...appended],
     deriveEventMessage: event => (event.type === 'user/message' ? event.data : (event.data ? event.data.message : null)),
     append: (type, data, intent) => {
@@ -826,10 +829,11 @@ test('编辑过的模型输出仍标为 assistant（类型要看消息，不能�
 
 test('编辑正文时思维链保留；也可以单独改写思维链', () => {
   const events = [
-    { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
-    { type: 'step/start', seq: 1, time: 0, data: { turn: 1, step: 1 } },
+    { type: 'system/message', seq: 0, time: 0, data: { turn: 1, step: 1, message: { id: 'sys-coc', role: 'system', content: [{ type: 'text', text: 'sys' }], source: { kind: 'system-prompt' } } } },
+    { type: 'turn/start', seq: 1, time: 0, data: { turn: 1 } },
+    { type: 'step/start', seq: 2, time: 0, data: { turn: 1, step: 1 } },
     {
-      type: 'assistant/message', seq: 2, time: 3,
+      type: 'assistant/message', seq: 3, time: 3,
       data: {
         turn: 1, step: 1,
         message: { id: 'a', role: 'assistant', content: [{ type: 'reasoning', text: '原始思考' }, { type: 'text', text: '原始回答' }], source: { kind: 'model', provider: 'p', model: 'm' } },
@@ -840,7 +844,7 @@ test('编辑正文时思维链保留；也可以单独改写思维链', () => {
   const appended = []
   const session = {
     id: 'session-coc', seq: 10, header: { cwd: sandbox },
-    surface: { nodes: [2] },
+    surface: { nodes: [0, 3] },
     snapshotEvents: () => events,
     deriveEventMessage: event => (event.data && event.data.message ? event.data.message : event.data),
     append: (type, data, intent) => {
@@ -852,7 +856,7 @@ test('编辑正文时思维链保留；也可以单独改写思维链', () => {
   }
   const ctx = { sessions: { get: () => session } }
 
-  history.applyEdit(ctx, 'session-coc', 2, '改过的回答')
+  history.applyEdit(ctx, 'session-coc', 3, '改过的回答')
   // 模型输出走重放：appended[0] 是遮蔽，appended[1] 才是编辑后的消息
   assert.equal(appended[0].type, 'system/message')
   const replayed = appended[1]
@@ -861,7 +865,7 @@ test('编辑正文时思维链保留；也可以单独改写思维链', () => {
   assert.equal(replayed.data.message.content[1].text, '原始思考')
 
   // 第一次编辑后 surface 指向重放出来的新节点，第二次要对它操作
-  session.surface.nodes = [replayed.seq]
+  session.surface.nodes = [0, replayed.seq]
   history.applyEdit(ctx, 'session-coc', replayed.seq, undefined, undefined, undefined, '改过的思考')
   const kept = appended[3].data.message.content
   assert.equal(kept.find(b => b.type === 'reasoning').text, '改过的思考')
@@ -1379,60 +1383,29 @@ test('导入会话：中间一条坏数据只跳过它自己，后面的消息�
   assert.deepEqual(result.warnings, [])
 })
 
-test('导入会话：工具调用与工具返回成对导入，callId 三种来源都能取到', () => {
-  // v4：callId 只挂在条目顶层的 toolCallId 上（content 里没有 tool-result 块）
+test('导入会话：工具调用与工具返回一律跳过（三件套不齐会写坏会话）', () => {
+  // 用户实测：导入带有工具轨迹的会话后，会话变成
+  //   system/message requires a protected first surface head / tool/result ... is not the exact TOOL_NOT_STARTED repair
+  // 打不开。dsh 要求「assistant 声明 tool-call → tool/call → tool/result」三件套齐全，
+  // 而 tool/call 只在工具真正执行时才有，导入只能搬一部分 —— 所以整类跳过，正文照常进来。
   const v4 = movableSession([sysEvent(0, 'sys')], [0])
   v4.session.header.version = 4
   const ctx4 = { sessions: { get: () => v4.session }, agents: { list: () => [] } }
-  const ordered = http.importMessages(ctx4, 'session-move', [
-    { id: 'res-v4', kind: 'tool-result', text: '文件内容', toolCallId: 'call-v4' },
+  const result = http.importMessages(ctx4, 'session-move', [
+    { id: 'u-1', kind: 'user', text: '问一句话' },
     {
-      id: 'call-v4', kind: 'tool-call', text: '读一下', toolName: 'read_file', toolInput: '{"path":"a.md"}',
-      parts: [{ kind: 'tool-call', callId: 'call-v4', toolName: 'read_file', toolInput: '{"path":"a.md"}' }],
+      id: 'a-1', kind: 'assistant', text: '读一下',
+      blocks: [{ type: 'text', text: '读一下' }, { type: 'tool-call', id: 'call-v4', name: 'read_file', arguments: '{}' }],
     },
+    { id: 'res-v4', kind: 'tool-result', text: '文件内容', toolCallId: 'call-v4' },
   ])
-  assert.equal(ordered.imported, 2, JSON.stringify(ordered.skippedReasons))
-  assert.deepEqual(v4.appended.map(event => event.type), ['assistant/message', 'tool/result'], '调用必须先落、返回后落')
-  const callBlock = v4.appended[0].data.message.content.find(block => block.type === 'tool-call')
-  assert.equal(callBlock.id, 'call-v4')
-  assert.equal(v4.appended[1].data.message.role, 'tool')
-  assert.equal(v4.appended[1].data.message.toolCallId, 'call-v4')
-  assert.ok(ordered.warnings.some(text => text.indexOf('调整顺序') >= 0), '自动补序要留下提示')
-
-  // v3：callId 藏在 parts 的 tool-result 块里（旧导出文件）
-  const v3 = movableSession([sysEvent(0, 'sys')], [0])
-  const ctx3 = { sessions: { get: () => v3.session }, agents: { list: () => [] } }
-  const paired = http.importMessages(ctx3, 'session-move', [
-    { id: 'call-3', kind: 'tool-call', text: '', parts: [{ kind: 'tool-call', callId: 'c-3', toolName: 't', toolInput: '{}' }] },
-    { id: 'res-3', kind: 'tool-result', text: '结果', parts: [{ kind: 'tool-result', callId: 'c-3' }] },
-  ])
-  assert.equal(paired.imported, 2, JSON.stringify(paired.skippedReasons))
-  assert.equal(v3.appended[1].type, 'tool/result')
-  assert.equal(v3.appended[1].data.message.role, 'user', 'v3 的 tool/result 仍是 role:user 包装')
-  assert.equal(v3.appended[1].data.message.content[0].toolCallId, 'c-3')
-
-  // 顶层 callId（手工拼的 JSON）同样认
-  const manual = movableSession([sysEvent(0, 'sys')], [0])
-  const ctxManual = { sessions: { get: () => manual.session }, agents: { list: () => [] } }
-  const fromTop = http.importMessages(ctxManual, 'session-move', [
-    { id: 'call-top', kind: 'tool-call', text: '', callId: 'top-1' },
-    { id: 'res-top', kind: 'tool-result', text: '结果', callId: 'top-1' },
-  ])
-  assert.equal(fromTop.imported, 2, JSON.stringify(fromTop.skippedReasons))
-  assert.equal(manual.appended[1].data.message.content[0].toolCallId, 'top-1')
-
-  // 没写 callId 的工具返回会自动接上最近一条还没返回的调用，并在 warnings 里留痕
-  const auto = movableSession([sysEvent(0, 'sys')], [0])
-  const ctxAuto = { sessions: { get: () => auto.session }, agents: { list: () => [] } }
-  const autoResult = http.importMessages(ctxAuto, 'session-move', [
-    { id: 'call-auto', kind: 'tool-call', text: '', callId: 'auto-1' },
-    { id: 'res-auto', kind: 'tool-result', text: '结果' },
-  ])
-  assert.equal(autoResult.imported, 2, JSON.stringify(autoResult.skippedReasons))
-  assert.equal(auto.appended[1].data.message.content[0].toolCallId, 'auto-1', '自动配对要接上前一条调用')
-  assert.ok(autoResult.warnings.some(text => text.indexOf('没有 callId') >= 0))
+  assert.equal(result.imported, 2, JSON.stringify(result.skippedReasons))
+  assert.ok(result.skippedReasons.some(row => /工具轨迹/.test(row.reason)), '要说明为什么跳过')
+  assert.equal(v4.appended.some(event => event.type === 'tool/result'), false, '工具返回不能写进来')
+  const assistant = v4.appended.find(event => event.type === 'assistant/message')
+  assert.equal(assistant.data.message.content.some(block => block.type === 'tool-call'), false, '工具调用声明也不能带进来')
+  assert.deepEqual(visibleTexts(v4), ['sys', '问一句话', '读一下'])
 })
-
 test('import-entries：把 JSON 消息写成手动上下文条目，重名与非法名字只跳过自己', async () => {
   const cwd = join(sandbox, 'ws-import-entries')
   const session = { id: 'session-entries', header: { cwd } }
@@ -1521,21 +1494,22 @@ test('导出 → 导入往返：工具轨迹与正文都不丢、不重复', () 
     agents: { list: () => [{ id: 'session-move', options: { provider: 'deepseek', model: 'v3' } }] },
   }
   const result = http.importMessages(ctxTarget, 'session-move', file.messages)
-  assert.equal(result.imported, 3, JSON.stringify(result.skippedReasons))
-  assert.equal(result.skipped, 1)
-  assert.match(result.skippedReasons[0].reason, /系统提示词/)
-  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话', '文件内容'], '正文与工具返回一条都不能丢')
+  // 工具轨迹整体不导入（三件套不齐会写坏会话，详见 importMessages 里的说明）；
+  // 正文照常进来，工具调用块被剥掉。
+  assert.equal(result.imported, 2, JSON.stringify(result.skippedReasons))
+  assert.equal(result.skipped, 2)
+  assert.ok(result.skippedReasons.some(row => /系统提示词/.test(row.reason)))
+  assert.ok(result.skippedReasons.some(row => /工具轨迹/.test(row.reason)))
+  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话'], '正文一条都不能丢')
   const assistant = target.appended.find(event => event.type === 'assistant/message')
-  const callBlock = assistant.data.message.content.find(block => block.type === 'tool-call')
-  assert.equal(callBlock.id, 'call-1', '模型输出里的工具调用要连着 callId 一起导进来')
-  const toolResult = target.appended.find(event => event.type === 'tool/result')
-  assert.equal(toolResult.data.message.toolCallId, 'call-1')
+  assert.equal(assistant.data.message.content.some(block => block.type === 'tool-call'), false, '工具调用块不能带进来')
+  assert.equal(target.appended.some(event => event.type === 'tool/result'), false, '工具返回不能带进来')
 
   // 同一份文件再导一次：全部按 message.id 去重，不翻倍
   const again = http.importMessages(ctxTarget, 'session-move', file.messages)
   assert.equal(again.imported, 0)
   assert.equal(again.skipped, 4)
-  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话', '文件内容'])
+  assert.deepEqual(visibleTexts(target), ['sys', '问一句话', '答一句话'])
 })
 
 test('导入修复前导出的旧文件（工具返回没有 callId）也能自动配对', () => {
@@ -1550,10 +1524,10 @@ test('导入修复前导出的旧文件（工具返回没有 callId）也能自�
     },
     { id: 't-old', kind: 'tool-result', text: '文件内容' },
   ])
-  assert.equal(result.imported, 3, JSON.stringify(result.skippedReasons))
-  assert.equal(built.appended[2].data.message.toolCallId, 'call-old', '要接上模型输出里的工具调用')
-  assert.ok(result.warnings.some(text => text.indexOf('没有 callId') >= 0))
-  assert.deepEqual(visibleTexts(built), ['sys', '问', '读一下', '文件内容'])
+  // 工具返回被跳过（孤儿的工具轨迹会让会话打不开），正文照常进来
+  assert.equal(result.imported, 2, JSON.stringify(result.skippedReasons))
+  assert.ok(result.skippedReasons.some(row => /工具轨迹/.test(row.reason)))
+  assert.deepEqual(visibleTexts(built), ['sys', '问', '读一下'])
 })
 
 

@@ -637,14 +637,11 @@ function importedBlocks(item) {
     if (value === '') return
     blocks.push(type === 'reasoning' ? { type: 'reasoning', text: value } : { type: 'text', text: value })
   }
-  const pushCall = function (name, args, callId) {
-    blocks.push({
-      type: 'tool-call',
-      // 没有 callId 就现生成一个：否则后面的工具返回永远配不上对。
-      callId: typeof callId === 'string' && callId !== '' ? callId : 'manual-call-' + randomUUID(),
-      name: typeof name === 'string' && name !== '' ? name : 'manual_tool',
-      args,
-    })
+  // 工具调用块**不再还原**：工具轨迹是「assistant 声明 tool-call → tool/call → tool/result」
+  // 三件套，而 tool/call 只在工具真正执行时才有。只把声明和结果搬过来会把会话写坏：
+  // 声明留着 → step/end 报「留下未完成的调用」；结果留着 → 报「工具返回没有调用生命周期」。
+  const pushCall = function () {
+    return
   }
   const raw = Array.isArray(item?.blocks) ? item.blocks : []
   const parts = Array.isArray(item?.parts) ? item.parts : []
@@ -791,6 +788,12 @@ export function importMessages(ctx, sessionId, items) {
       const raw = typeof item.kind === 'string' && item.kind !== '' ? item.kind : (typeof item.role === 'string' ? item.role : '')
       skip(index, item.id, '不支持的消息类型' + (raw === '' ? '' : '：' + raw)
         + '（只能导入 user / assistant / reasoning / tool-call / tool-result）')
+      continue
+    }
+    // 工具调用 / 工具返回条目整条跳过，并说明原因（见上面 pushCall 的注释）。
+    if (spec.kind === 'tool-call' || spec.kind === 'tool-result') {
+      skip(index, item.id, '工具轨迹（工具调用 / 工具返回）需要「声明 + 调用开始 + 返回」三件套齐全，'
+        + '导入只能搬一部分、写进去会让会话打不开 —— 已跳过')
       continue
     }
     if (spec.kind === 'tool-call' && typeof spec.callId === 'string' && spec.callId !== '') seenCallIds.add(spec.callId)
